@@ -1,89 +1,107 @@
-# `make_vasp_submit.sh` — scheduler-agnostic VASP submission scripts
+# `run_vasp_ml_ai.sh` — two-stage VASP driver (ML force field → ab initio)
 
-A generator, not a runner. You configure the job once at the top of
-`make_vasp_submit.sh`; it writes the batch script(s) with the right directives
-for whichever scheduler the machine happens to use, plus a `submit_all.sh`
-driver that submits them with the correct dependency syntax.
+One script that runs VASP. Everything machine-specific lives in four heredoc
+sections at the top, which you fill in by pasting your own files:
 
-Supported schedulers: `slurm`, `pbs` (PBSPro/Torque), `lsf`, `sge`, and `none`
-(plain shell, e.g. a workstation or an interactive allocation).
+| Section | You paste | Marker |
+|---|---|---|
+| 1 | your submission-script header (directives, modules, exports, `ulimit`) | `END_SUBMIT_HEADER` |
+| 2 | your INCAR, with the ML tags active | `END_INCAR` |
+| 3 | your KPOINTS | `END_KPOINTS` |
+| 4 | the line that launches VASP (`srun …`, `mpirun …`) | `VASP_CMD=` |
 
-## The workflow it generates
+It is scheduler-agnostic because it never writes batch directives itself: your
+header is copied verbatim into the generated job script and submitted with the
+command you name in `SUBMIT_CMD` (`sbatch`, `qsub`, `bsub`, …).
 
-Same two-stage strategy in every case:
+## What it does
 
-| Stage | INCAR | Loop |
-|-------|-------|------|
-| 1 — `ml` | ML tags active (`ML_LMLFF = T`, `ML_MODE = run`) | restart from `CONTCAR` until converged, up to `MAX_ML_CYCLES` |
-| 2 — `ai` | ML tags commented out | seeded from the stage-1 geometry, up to `MAX_AI_CYCLES` |
+1. **Stage `ml`** — writes INCAR and KPOINTS, runs VASP with the ML force field
+   active, and if the run has not converged copies `CONTCAR` → `POSCAR` and runs
+   again, up to `MAX_ML_CYCLES` times.
+2. **Stage `ai`** — writes the *same* INCAR with every `ML_` line commented out,
+   starting from the `CONTCAR` stage 1 produced, up to `MAX_AI_CYCLES` times.
 
-Convergence is detected in `vasp.out` via
+Convergence is the usual VASP line in `vasp.out`:
 `reached required accuracy - stopping structural energy minimisation`.
-For a plain MD run (`IBRION = 0`) that line never appears, so set
-`REQUIRE_CONV_ML=no` and normal termination (`General timing and accounting`)
-is used instead.
 
-Each cycle's `vasp.out`, `OUTCAR`, `OSZICAR`, `CONTCAR`, `XDATCAR`, `INCAR`,
-and ML files are archived under `stage_ml/` and `stage_ai/`. A completed stage
-drops a `.stage_<name>.done` marker, so a requeued job resumes rather than
-redoing finished work.
+Each cycle's `INCAR`, `vasp.out`, `OUTCAR`, `OSZICAR`, `CONTCAR`, `XDATCAR` and
+ML files are archived into `stage_ml/` and `stage_ai/` as `<file>.cycleN`, and
+each `POSCAR` is backed up before being overwritten. A finished stage drops a
+`.stage_<name>.done` marker, so a requeued or re-run job resumes instead of
+repeating work already done.
 
-## Walltimes
+## Usage
 
-The two stages get separate hardcoded walltimes, since ML/MD work is normally
-much cheaper than ab initio:
+```bash
+./run_vasp_ml_ai.sh              # write the job script and submit it
+./run_vasp_ml_ai.sh write        # write the job script, don't submit
+./run_vasp_ml_ai.sh run          # run both stages here and now
+./run_vasp_ml_ai.sh run ml       # run only the ML stage
+./run_vasp_ml_ai.sh run ai       # run only the ab initio stage
+```
+
+Inputs needed in the run directory: `POSCAR`, `POTCAR`, `ML_FF`. `INCAR` and
+`KPOINTS` are written by the script — edit the heredocs, not those files.
+
+`run` replays your header first (batch directives are just comments), so it
+works unchanged inside an interactive allocation or on a workstation.
+
+## Walltimes and job layout
+
+The two stages have separate hardcoded walltimes, since ML/MD cycles are
+normally much cheaper than ab initio ones:
 
 ```bash
 WALLTIME_ML="${WALLTIME_ML:-04:00:00}"      # stage 1
 WALLTIME_AI="${WALLTIME_AI:-24:00:00}"      # stage 2
 ```
 
-With `SPLIT_JOBS=yes` (default) each stage becomes its own job carrying its own
-walltime, chained so stage 2 only starts if stage 1 succeeds. With
-`SPLIT_JOBS=no` both stages run in one job whose walltime is the sum.
+They are substituted into the `@WALLTIME@` placeholder in your header (and
+`@JOBNAME@` for the job name). How they are used depends on `JOB_LAYOUT`:
 
-## Usage
+- `single` (default) — one job runs both stages; `@WALLTIME@` becomes the sum
+  (`28:00:00` with the defaults above).
+- `chain` — one job per stage, each with its own walltime. The ML job submits
+  the ab initio job itself once it converges, so no scheduler dependency syntax
+  is involved. Requires that your submit command works from a compute node,
+  which most but not all sites allow.
 
-```bash
-./make_vasp_submit.sh                  # write scripts into ./
-./submit_all.sh                        # submit them
+If your header has no `@WALLTIME@` placeholder, it is copied through untouched
+and whatever walltime you hardcoded in it applies to both stages; `chain` mode
+says so when you submit.
 
-# any config variable can also be overridden from the environment
-SCHEDULER=pbs QUEUE=normal ./make_vasp_submit.sh
-WALLTIME_ML=02:00:00 WALLTIME_AI=48:00:00 NODES=2 ./make_vasp_submit.sh
-SCHEDULER=none LAUNCHER=mpirun OUTDIR=runs/defect_a ./make_vasp_submit.sh
-```
-
-Required inputs in the run directory: `POSCAR`, `POTCAR`, and `ML_FF` (the last
-only when `ML_MODE=run`). `INCAR` and `KPOINTS` are written by the job itself.
-
-## Configuration reference
+## Other settings
 
 | Variable | Meaning |
 |---|---|
-| `SCHEDULER` | `slurm` \| `pbs` \| `lsf` \| `sge` \| `none` |
-| `SPLIT_JOBS` | `yes` = two chained jobs; `no` = one job, walltimes summed |
-| `WALLTIME_ML` / `WALLTIME_AI` | per-stage walltime, `HH:MM:SS` (converted per scheduler) |
-| `JOB_NAME`, `ACCOUNT`, `QUEUE` | naming and accounting; empty `ACCOUNT`/`QUEUE` omits the directive |
-| `NODES`, `NTASKS_PER_NODE`, `CPUS_PER_TASK` | ranks = `NODES × NTASKS_PER_NODE`; `CPUS_PER_TASK` sets `OMP_NUM_THREADS` |
-| `MEM_PER_NODE`, `EXCLUSIVE` | memory request (empty = omit), whole-node request |
-| `VASP_BIN`, `MODULES`, `ENV_EXPORTS` | binary, modules to load, extra environment |
-| `LAUNCHER`, `LAUNCHER_EXTRA` | `auto` picks `srun` under Slurm, `mpirun` otherwise; `none` runs serially |
-| `SLINGSHOT_VNI_WORKAROUND`, `UNLIMIT_STACK` | Cray shared-node `FI_CXI_DEFAULT_VNI` fix; `ulimit -s unlimited` |
+| `SUBMIT_CMD`, `SUBMIT_VIA_STDIN` | how to submit (`SUBMIT_VIA_STDIN=yes` gives `bsub < script` for LSF) |
+| `JOB_NAME` | base job name, `-ml`/`-ai` suffixed in chain layout |
 | `MAX_ML_CYCLES`, `MAX_AI_CYCLES` | restart caps per stage |
-| `REQUIRE_CONV_ML`, `REQUIRE_CONV_AI` | require the convergence line, or accept normal termination |
+| `REQUIRE_CONV_ML`, `REQUIRE_CONV_AI` | set to `no` for a pure MD run (`IBRION = 0`), where the convergence line is never printed and normal termination is accepted instead |
 | `CONV_REGEX`, `DONE_REGEX` | patterns matched against `vasp.out` |
-| `ML_MODE` | `run` \| `train` \| `refit`; non-`run` promotes `ML_FFN`→`ML_FF` between cycles |
-| `SYSTEM_NAME`, `INCAR_COMMON`, `INCAR_ML_EXTRA`, `INCAR_AI_EXTRA`, `INCAR_ML_TAGS` | INCAR contents; the per-stage arrays override matching keys in `INCAR_COMMON` |
-| `WRITE_KPOINTS`, `KPOINTS_MODE`, `KPOINTS_MESH`, `KPOINTS_SHIFT` | KPOINTS generation (`WRITE_KPOINTS=no` keeps an existing file) |
-| `OUTDIR` | where the generated scripts are written |
+| `ML_LINE_REGEX` | which INCAR lines get commented out for stage 2 (default: anything starting with `ML_`) |
+| `INCAR_AI_TEMPLATE` | optional separate INCAR for stage 2 instead of auto-commenting |
+| `REQUIRED_ML`, `REQUIRED_AI` | files checked before each stage starts |
+| `PROMOTE_ML_FF` | `yes` copies `ML_FFN`→`ML_FF` between cycles (for `ML_MODE = train`/`refit`) |
+| `ARCHIVE_FILES` | files copied into `stage_*/` after every cycle |
 
-The `INCAR_*` and `ENV_EXPORTS` settings are bash arrays, so edit those in the
-file rather than passing them through the environment.
+All of them can also be set from the environment for a one-off run, e.g.
+`WALLTIME_AI=48:00:00 JOB_LAYOUT=chain ./run_vasp_ml_ai.sh`.
 
-## Porting to a new machine
+## Porting to another machine
 
-Usually three lines: `SCHEDULER`, `VASP_BIN`, `MODULES` — plus `ACCOUNT`/`QUEUE`
-and the resource block. Everything scheduler-specific (directives, the MPI
-launcher, walltime format, job-dependency syntax, the submit-directory `cd`)
-is derived from `SCHEDULER`.
+Replace section 1 with that machine's header, section 4 with its launch line,
+and set `SUBMIT_CMD`. Nothing else is scheduler-aware: the job script `cd`s to
+an absolute path rather than relying on `$SLURM_SUBMIT_DIR`/`$PBS_O_WORKDIR`,
+and chaining is done by self-submission rather than dependency flags.
+
+## Testing it without a queue
+
+Point `SUBMIT_CMD` at `bash` to execute the generated job script immediately in
+the current shell — useful for checking the workflow end to end (optionally with
+a stub `$VASP`) before burning an allocation:
+
+```bash
+SUBMIT_CMD=bash ./run_vasp_ml_ai.sh
+```
