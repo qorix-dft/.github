@@ -1,0 +1,398 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Exact control for the analytic monopole tail in pl_embedding.py.
+
+The point of the control is that the untruncated answer is known. A 10x8
+reference embedded into a 15x9 target is truncated; the 15x9 reference embedded
+into the SAME 15x9 target is not, because every target atom is matched. So the
+15x9 case is the exact answer that the 10x8 case must reproduce.
+
+Four cases are run, and the middle two are what make the result interpretable:
+
+  1. trunc      10x8 reference, truncated                 (current behaviour)
+  2. trunc+SR   10x8 reference, truncated, sum rule re-imposed, NO tail
+  3. tail+SR    10x8 reference + analytic monopole tail + sum rule
+  4. reference  15x9 reference on the same target         (untruncated answer)
+
+Case 2 isolates the sum rule from the tail. Truncation with bijective mapping
+already satisfies sum_a dF_a = 0 to ~1e-5 eV/A, so case 2 is expected to change
+almost nothing; if instead it removes a large fraction of the error, then the
+tail is solving a smaller problem than the physics argument claims and that must
+be known before the result is used.
+
+Alongside the spectral windows the script reports criterion C3,
+
+    F~(q) = | sum_a m_a^(-1/2) dF_a exp(i q.R_a) |
+
+at the smallest few non-zero target q. That is the quantity truncation actually
+damages -- F~(0) is left intact by the bijective mapping -- and the 1/E^2 in
+ConfigCoordinatesF (S_k ~ proj^2 / E^3) is what turns it into spurious weight
+below 5 meV.
+"""
+
+import argparse
+
+import numpy as np
+
+from pl_embedding import (
+    Photoluminescence,
+    apply_analytic_tail_to_difference,
+    apply_force_embedding_mapping,
+    build_unit_to_target_force_mapping,
+    enforce_force_sum_rule,
+    force_structure_factor,
+    read_poscar,
+    smallest_nonzero_q,
+)
+
+
+# ---- EDIT THESE PATHS ----
+OUTCAR_ES_10x8 = "../10x8/ex/OUTCAR"
+OUTCAR_GS_10x8 = "../10x8/gs/OUTCAR"
+OUTCAR_ES_15x9 = "../15x9/ex/OUTCAR"
+OUTCAR_GS_15x9 = "../15x9/gs/OUTCAR"
+TARGET_POSCAR = "../relax/CONTCAR"          # the 15x9 target, same for every case
+BAND_YAML = "../phonons/band.yaml"          # Gamma-point modes of the 15x9 target
+
+DELTA_Q = 1                                  # +1 for C_B, -1 for C_N
+DEFECT_INDEX = None                          # None -> minority species (the carbon)
+FIT_WINDOW = (6.0, 16.0)
+
+EMBED_TOLERANCE = 9e-2
+EMBED_PBC = True
+EMBED_BIJECTIVE = True
+
+SIGMA_MEV = 6.0                              # broadening used by SpectralFunction
+E_GRID_MAX_MEV = 260.0
+E_GRID_STEP_MEV = 0.05
+N_Q_SMALLEST = 5
+
+WINDOWS_MEV = [
+    (0.0, 5.0),
+    (0.0, 10.0),
+    (10.0, 20.0),
+    (20.0, 50.0),
+    (50.0, 100.0),
+    (100.0, 150.0),
+    (150.0, 220.0),
+]
+
+CASES = ["trunc", "trunc+SR", "tail+SR", "reference"]
+REFERENCE_CASE = "reference"
+
+
+def trapezoid(y, x):
+    """Trapezoidal integral, written out so no NumPy version quirks apply."""
+    y = np.asarray(y, dtype=float)
+    x = np.asarray(x, dtype=float)
+    if y.size < 2:
+        return 0.0
+    return float(np.sum(0.5 * (y[1:] + y[:-1]) * np.diff(x)))
+
+
+def build_difference_force(outcar_es, outcar_gs, target_poscar, mode, args):
+    """
+    Embed one reference into the target and return the difference force field.
+
+    mode is one of:
+        "raw"      dF = F_es - F_gs, unmatched atoms left at zero (truncation)
+        "sumrule"  as "raw", then sum_a dF_a = 0 re-imposed
+        "tail"     as "raw", then the unmatched atoms filled with the fitted
+                   analytic monopole tail, then the sum rule re-imposed
+    """
+    target_to_unit, target_positions, mapping_info = build_unit_to_target_force_mapping(
+        unit_outcar=outcar_gs,
+        target_poscar=target_poscar,
+        tolerance=args.tolerance,
+        pbc=EMBED_PBC,
+        bijective=EMBED_BIJECTIVE,
+    )
+
+    F_es = apply_force_embedding_mapping(outcar_es, target_to_unit)
+    F_gs = apply_force_embedding_mapping(outcar_gs, target_to_unit)
+    dF = F_es - F_gs
+
+    tail_info = None
+    if mode == "sumrule":
+        dF, _ = enforce_force_sum_rule(dF)
+    elif mode == "tail":
+        dF, tail_info = apply_analytic_tail_to_difference(
+            F_es=F_es,
+            F_gs=F_gs,
+            target_positions=target_positions,
+            target_to_unit=target_to_unit,
+            target_poscar=target_poscar,
+            delta_q=args.delta_q,
+            defect_index=args.defect_index,
+            fit_window=(args.fit_lo, args.fit_hi),
+            enforce_sum_rule=True,
+            verbose=True,
+        )
+    elif mode != "raw":
+        raise ValueError(f"Unknown mode '{mode}'.")
+
+    return dF, target_positions, target_to_unit, mapping_info, tail_info
+
+
+def spectrum_from_dF(pl, dF, masses, modes, freqs, Ek, E_grid, sigma):
+    """Partial HR factors and the broadened spectral function for one dF."""
+    qk = pl.ConfigCoordinatesF(masses, None, None, modes, Ek, F_diff=dF)
+    Sk = pl.PartialHR(freqs, qk)
+    S_E = pl.SpectralFunction(Sk, Ek, E_grid, sigma=sigma)
+    return Sk, S_E
+
+
+def window_integrals(S_E, E_grid, Sk, Ek):
+    """
+    Two measures per window: the integral of the broadened S(E), and the raw
+    sum of S_k over modes whose energy falls in the window.
+
+    The broadened integral is what the production pipeline produces, but with
+    sigma = 6 meV a 0-5 meV window also collects leakage from modes well above
+    it. The raw mode sum has no broadening and is therefore unambiguous. If the
+    tail works, both must improve.
+    """
+    integ, raw = [], []
+    for lo, hi in WINDOWS_MEV:
+        m = (E_grid >= lo) & (E_grid <= hi)
+        integ.append(trapezoid(S_E[m], E_grid[m]))
+        mk = (Ek >= lo) & (Ek <= hi)
+        raw.append(float(np.sum(Sk[mk])))
+    return np.array(integ), np.array(raw)
+
+
+def print_table(title, values, ratios, note=""):
+    print("")
+    print(title)
+    if note:
+        print(f"  {note}")
+    header = f"  {'window (meV)':<16}"
+    for c in CASES:
+        header += f"{c:>14}{'ratio':>9}"
+    print(header)
+    print("  " + "-" * (16 + 23 * len(CASES)))
+    for i, (lo, hi) in enumerate(WINDOWS_MEV):
+        row = f"  {f'{lo:g} - {hi:g}':<16}"
+        for c in CASES:
+            row += f"{values[c][i]:>14.6e}"
+            row += f"{ratios[c][i]:>9.3f}" if np.isfinite(ratios[c][i]) else f"{'--':>9}"
+        print(row)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Exact control for the analytic monopole tail.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--outcar-es-small", default=OUTCAR_ES_10x8)
+    parser.add_argument("--outcar-gs-small", default=OUTCAR_GS_10x8)
+    parser.add_argument("--outcar-es-large", default=OUTCAR_ES_15x9)
+    parser.add_argument("--outcar-gs-large", default=OUTCAR_GS_15x9)
+    parser.add_argument("--target-poscar", default=TARGET_POSCAR)
+    parser.add_argument("--band-yaml", default=BAND_YAML)
+    parser.add_argument("--delta-q", type=int, default=DELTA_Q)
+    parser.add_argument("--defect-index", type=int, default=DEFECT_INDEX)
+    parser.add_argument("--fit-lo", type=float, default=FIT_WINDOW[0])
+    parser.add_argument("--fit-hi", type=float, default=FIT_WINDOW[1])
+    parser.add_argument("--tolerance", type=float, default=EMBED_TOLERANCE)
+    parser.add_argument("--sigma", type=float, default=SIGMA_MEV)
+    parser.add_argument("--n-q", type=int, default=N_Q_SMALLEST)
+    parser.add_argument(
+        "--include-out-of-plane-q",
+        action="store_true",
+        help="include reciprocal vectors along the vacuum direction in the C3 table",
+    )
+    args = parser.parse_args()
+
+    pl = Photoluminescence()
+
+    masses, freqs, modes = pl.ReadPhononsPhonopy(args.band_yaml, freq_cutoff=0.1)
+    freqs = freqs[: int(freqs.shape[0] / 2)]
+    modes = modes[: int(modes.shape[0] / 2), ...]
+    Ek = pl.FreqToEnergy(freqs)
+    Ek[Ek == 0] = 1e-5
+
+    lattice, species_names, counts, _ = read_poscar(args.target_poscar)
+    n_atoms = int(np.sum(counts))
+    if masses.shape[0] != n_atoms:
+        raise ValueError(
+            f"band.yaml has {masses.shape[0]} atoms but the target POSCAR has {n_atoms}. "
+            "The modes and the target must describe the same cell, in the same order."
+        )
+
+    print("=" * 74)
+    print(" MONOPOLE TAIL VALIDATION")
+    print("=" * 74)
+    print(f"  target            : {args.target_poscar}  ({n_atoms} atoms, {species_names} {counts})")
+    print(f"  modes             : {args.band_yaml}  ({modes.shape[0]} modes)")
+    print(f"  Delta q           : {args.delta_q:+d}")
+    print(f"  fit window        : [{args.fit_lo:g}, {args.fit_hi:g}) A")
+    print(f"  broadening sigma  : {args.sigma:g} meV")
+
+    E_grid = np.arange(0.0, E_GRID_MAX_MEV + E_GRID_STEP_MEV, E_GRID_STEP_MEV)
+
+    plan = {
+        "trunc": (args.outcar_es_small, args.outcar_gs_small, "raw"),
+        "trunc+SR": (args.outcar_es_small, args.outcar_gs_small, "sumrule"),
+        "tail+SR": (args.outcar_es_small, args.outcar_gs_small, "tail"),
+        "reference": (args.outcar_es_large, args.outcar_gs_large, "raw"),
+    }
+
+    dF_all, Sk_all, integ_all, raw_all, stot_all = {}, {}, {}, {}, {}
+    positions_ref = None
+
+    for case in CASES:
+        outcar_es, outcar_gs, mode = plan[case]
+        print("")
+        print("-" * 74)
+        print(f" case: {case}   ({mode} embedding of {outcar_gs})")
+        print("-" * 74)
+
+        dF, positions, target_to_unit, mapping_info, _ = build_difference_force(
+            outcar_es, outcar_gs, args.target_poscar, mode, args
+        )
+        positions_ref = positions
+
+        n_unmatched = int(np.sum(target_to_unit < 0))
+        print(
+            f"  matched {mapping_info['matched_unit_atoms']} / target {mapping_info['n_target']}, "
+            f"unmatched target atoms {n_unmatched}, "
+            f"max match distance {mapping_info['max_match_distance_A']:.4f} A"
+        )
+        if case == REFERENCE_CASE and n_unmatched != 0:
+            print(
+                f"  *** WARNING: the reference case left {n_unmatched} target atoms unmatched. "
+                "It is meant to be the untruncated answer; check the tolerance and the cells."
+            )
+        print(f"  |sum dF| = {np.linalg.norm(dF.sum(axis=0)):.3e} eV/A")
+
+        Sk, S_E = spectrum_from_dF(pl, dF, masses, modes, freqs, Ek, E_grid, args.sigma)
+        integ, raw = window_integrals(S_E, E_grid, Sk, Ek)
+
+        dF_all[case] = dF
+        Sk_all[case] = Sk
+        integ_all[case] = integ
+        raw_all[case] = raw
+        stot_all[case] = float(np.sum(Sk))
+
+    ref_integ = integ_all[REFERENCE_CASE]
+    ref_raw = raw_all[REFERENCE_CASE]
+
+    ratios_integ = {
+        c: np.where(ref_integ != 0, integ_all[c] / np.where(ref_integ != 0, ref_integ, 1.0), np.nan)
+        for c in CASES
+    }
+    ratios_raw = {
+        c: np.where(ref_raw != 0, raw_all[c] / np.where(ref_raw != 0, ref_raw, 1.0), np.nan)
+        for c in CASES
+    }
+
+    print_table(
+        " Window-integrated S(E)   [ratio = case / reference]",
+        integ_all,
+        ratios_integ,
+        note=f"broadened with sigma = {args.sigma:g} meV, integrated on a "
+             f"{E_GRID_STEP_MEV:g} meV grid",
+    )
+    print_table(
+        " Raw mode sum  sum_k S_k over modes in window   [ratio = case / reference]",
+        raw_all,
+        ratios_raw,
+        note="no broadening, so no leakage between windows",
+    )
+
+    print("")
+    print(" Total Huang-Rhys factor")
+    print(f"  {'case':<16}{'S_tot':>14}{'ratio':>9}{'error':>10}")
+    print("  " + "-" * 49)
+    for c in CASES:
+        ratio = stot_all[c] / stot_all[REFERENCE_CASE]
+        print(f"  {c:<16}{stot_all[c]:>14.6f}{ratio:>9.4f}{100.0 * (ratio - 1.0):>9.2f}%")
+
+    # ---- criterion C3 --------------------------------------------------------
+    q_vectors, hkl = smallest_nonzero_q(
+        lattice, n_q=args.n_q, include_out_of_plane=args.include_out_of_plane_q
+    )
+    print("")
+    print(" Criterion C3: |F~(q)| = |sum_a m_a^(-1/2) dF_a exp(i q.R_a)|   [eV/A/sqrt(amu)]")
+    print(
+        "  smallest non-zero target q"
+        + ("" if args.include_out_of_plane_q else ", in-plane only (the vacuum direction is not")
+    )
+    if not args.include_out_of_plane_q:
+        print("  a physical wavevector for a slab; pass --include-out-of-plane-q to include it)")
+    header = f"  {'(h k l)':<12}{'|q| [1/A]':>12}"
+    for c in CASES:
+        header += f"{c:>14}{'ratio':>9}"
+    print(header)
+    print("  " + "-" * (24 + 23 * len(CASES)))
+
+    Fq = {c: force_structure_factor(dF_all[c], masses, positions_ref, q_vectors) for c in CASES}
+    for i in range(q_vectors.shape[0]):
+        row = f"  {str(tuple(int(v) for v in hkl[i])):<12}{np.linalg.norm(q_vectors[i]):>12.5f}"
+        for c in CASES:
+            row += f"{Fq[c][i]:>14.6e}"
+            ref_val = Fq[REFERENCE_CASE][i]
+            row += f"{(Fq[c][i] / ref_val):>9.3f}" if ref_val != 0 else f"{'--':>9}"
+        print(row)
+
+    q0 = np.zeros((1, 3))
+    print("")
+    print("  for comparison, q = 0 (the acoustic sum rule):")
+    for c in CASES:
+        print(f"    {c:<16}{force_structure_factor(dF_all[c], masses, positions_ref, q0)[0]:>14.6e}")
+
+    # ---- success criteria ----------------------------------------------------
+    print("")
+    print("=" * 74)
+    print(" SUCCESS CRITERIA")
+    print("=" * 74)
+
+    i05 = WINDOWS_MEV.index((0.0, 5.0))
+    i_opt = WINDOWS_MEV.index((150.0, 220.0))
+
+    err_trunc = abs(ratios_integ["trunc"][i05] - 1.0)
+    err_sr = abs(ratios_integ["trunc+SR"][i05] - 1.0)
+    err_tail = abs(ratios_integ["tail+SR"][i05] - 1.0)
+
+    print(
+        f"  S(E < 5 meV) ratio to reference: trunc {ratios_integ['trunc'][i05]:.3f}, "
+        f"trunc+SR {ratios_integ['trunc+SR'][i05]:.3f}, tail+SR {ratios_integ['tail+SR'][i05]:.3f}"
+    )
+    print(f"    [{'PASS' if err_tail < err_trunc else 'FAIL'}] the tail moves S(E < 5 meV) "
+          "towards the reference")
+    sr_share = (err_trunc - err_sr) / err_trunc if err_trunc > 0 else float("nan")
+    print(
+        f"    sum rule alone accounts for {100.0 * sr_share:.1f}% of the truncation error. "
+        "Expected to be small:"
+    )
+    print(
+        "    truncation with bijective mapping already satisfies the q = 0 sum rule, so a large "
+        "value here"
+    )
+    print("    would mean the tail is solving a smaller problem than the physics argument claims.")
+
+    stot_err = abs(stot_all["tail+SR"] / stot_all[REFERENCE_CASE] - 1.0)
+    print(
+        f"  S_tot error with tail: {100.0 * stot_err:.3f}%  "
+        f"[{'PASS' if stot_err < 0.01 else 'FAIL'}] (must stay within 1%)"
+    )
+
+    opt_ref = integ_all[REFERENCE_CASE][i_opt]
+    opt_tail = integ_all["tail+SR"][i_opt]
+    opt_trunc = integ_all["trunc"][i_opt]
+    unchanged = round(opt_tail, 3) == round(opt_trunc, 3)
+    print(
+        f"  optical window 150-220 meV: trunc {opt_trunc:.6f}, tail+SR {opt_tail:.6f}, "
+        f"reference {opt_ref:.6f}"
+    )
+    print(
+        f"    [{'PASS' if unchanged else 'FAIL'}] unchanged by the tail to three decimals"
+    )
+    print("=" * 74)
+
+
+if __name__ == "__main__":
+    main()
