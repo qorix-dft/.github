@@ -131,6 +131,162 @@ def read_last_total_force_block(outcar_path):
     return np.array(positions, dtype=float), np.array(forces, dtype=float)
 
 
+def read_phonon_points(path):
+    """
+    Per-atom species symbols and masses from the 'points' section of a band.yaml.
+
+    ReadPhononsPhonopy already reads the masses, but only the masses. Phonopy
+    also writes a symbol beside each one, which is what makes it possible to
+    check that the phonons and the target describe the same cell in the same
+    order rather than merely the same number of atoms.
+
+    Returns:
+        symbols: (N,) object array, or None if the file carries no symbol entries
+        masses:  (N,) array in amu
+    """
+    symbols, masses = [], []
+    with open(path, "r") as f:
+        for line in f:
+            if "symbol:" in line:
+                token = line.split("symbol:", 1)[1].split("#")[0].strip()
+                if token:
+                    symbols.append(token)
+            if "mass:" in line:
+                token = line.split("mass:", 1)[1].split("#")[0].strip()
+                if token:
+                    masses.append(float(token))
+
+    masses = np.array(masses, dtype=float)
+    if not symbols or len(symbols) != masses.shape[0]:
+        return None, masses
+    return np.array(symbols, dtype=object), masses
+
+
+def check_phonon_species_order(band_yaml, target_poscar, symbols=None, masses=None):
+    """
+    Verify that band.yaml and the target POSCAR describe one cell in one order.
+
+    ConfigCoordinatesF contracts modes[i, a, :] with dF[a, :] / sqrt(m_a), so
+    index a must be the same physical atom in the phonons, the target POSCAR and
+    the embedded force array. Only the atom COUNT is otherwise checked, and two
+    supercells of the same material with the defect on different sites have the
+    same count -- so a wrong band.yaml produces a plausible spectrum rather than
+    an error.
+
+    Two independent tests are applied:
+      - the per-atom symbol sequence against the POSCAR's species sequence, when
+        the file carries symbols;
+      - the masses grouped by POSCAR species, which must be constant within each
+        species and distinct between species. This needs no external mass table
+        and catches a relocated defect on its own: a carbon sitting where the
+        POSCAR says boron leaves a 12.011 among the 10.811s.
+
+    Returns:
+        dict with 'ok', the tests that ran, and the first few mismatches.
+    """
+    _, species_names, counts, _ = read_poscar(target_poscar)
+    labels = species_labels_from_counts(species_names, counts)
+    n_atoms = labels.shape[0]
+
+    if symbols is None or masses is None:
+        file_symbols, file_masses = read_phonon_points(band_yaml)
+        symbols = file_symbols if symbols is None else symbols
+        masses = file_masses if masses is None else masses
+
+    problems = []
+    tests = []
+
+    if masses.shape[0] != n_atoms:
+        problems.append(
+            f"band.yaml has {masses.shape[0]} atoms, the target POSCAR has {n_atoms}"
+        )
+        return {
+            "ok": False, "n_atoms_poscar": n_atoms, "n_atoms_band": int(masses.shape[0]),
+            "tests_run": ["atom count"], "problems": problems, "symbol_mismatches": [],
+        }
+    tests.append("atom count")
+
+    symbol_mismatches = []
+    if symbols is not None and symbols.shape[0] == n_atoms:
+        tests.append("symbol sequence")
+        differ = np.where(np.array([str(x) for x in symbols]) != np.array([str(x) for x in labels]))[0]
+        if differ.size:
+            symbol_mismatches = [
+                (int(i), str(symbols[i]), str(labels[i])) for i in differ[:5]
+            ]
+            problems.append(
+                f"{differ.size} of {n_atoms} atoms have a different species in band.yaml than in "
+                "the target POSCAR; first few (index, band.yaml, POSCAR): "
+                + ", ".join(f"({i}, {b}, {p})" for i, b, p in symbol_mismatches)
+            )
+
+    tests.append("mass grouping by species")
+    group_masses = {}
+    mass_groups_clean = True
+    for s in dict.fromkeys(species_names):
+        sel = np.array([str(x) for x in labels]) == str(s)
+        if not np.any(sel):
+            continue
+        block = masses[sel]
+        reference_mass = float(block[0])
+        stray = np.where(np.abs(block - reference_mass) > 1e-6)[0]
+        if stray.size:
+            mass_groups_clean = False
+            where = np.where(sel)[0][stray[:5]]
+            problems.append(
+                f"species '{s}' does not carry one mass in band.yaml: {stray.size} of "
+                f"{block.shape[0]} atoms differ from {reference_mass:.4f} amu; first few at "
+                "indices " + ", ".join(f"{int(i)} ({masses[i]:.4f})" for i in where)
+            )
+        group_masses[str(s)] = reference_mass
+
+    # Only meaningful when every group carried one mass. If some did not, a
+    # collapsed distinction is a symptom of that scrambling, not a separate finding.
+    if mass_groups_clean:
+        distinct = list(group_masses.items())
+        for i in range(len(distinct)):
+            for j in range(i + 1, len(distinct)):
+                if abs(distinct[i][1] - distinct[j][1]) <= 1e-6:
+                    problems.append(
+                        f"species '{distinct[i][0]}' and '{distinct[j][0]}' share the mass "
+                        f"{distinct[i][1]:.4f} amu, so the mass test cannot tell them apart"
+                    )
+
+    return {
+        "ok": not problems,
+        "n_atoms_poscar": n_atoms,
+        "n_atoms_band": int(masses.shape[0]),
+        "tests_run": tests,
+        "problems": problems,
+        "symbol_mismatches": symbol_mismatches,
+        "species_masses_amu": group_masses,
+        "symbols_available": symbols is not None,
+    }
+
+
+def phonon_species_order_message(band_yaml, target_poscar, result):
+    """The explanation printed or raised when check_phonon_species_order fails."""
+    lines = [
+        f"band.yaml and the target POSCAR do not describe the same cell in the same order.",
+        f"  phonons : {band_yaml}",
+        f"  target  : {target_poscar}",
+    ]
+    for p in result["problems"]:
+        lines.append(f"  - {p}")
+    lines.append(
+        "  The projection contracts mode component a with force row a, so a mismatch here "
+        "silently mixes atoms rather than failing. Two supercells of one material with the "
+        "defect on different sites have the same atom count and pass every other check, so "
+        "use the band.yaml built for THIS target."
+    )
+    if not result["symbols_available"]:
+        lines.append(
+            "  (This band.yaml carries no 'symbol:' entries, so only the mass grouping "
+            "could be tested.)"
+        )
+    return "\n".join(lines)
+
+
 # =============================================================================
 # Minimum-image distance under supercell PBC
 # =============================================================================
@@ -766,6 +922,40 @@ def image_ambiguity(lattice, positions, defect_index, atom_mask=None, tolerance=
     return int(np.sum(rel < float(tolerance)))
 
 
+def layer_indices(lattice, positions, tolerance=1.0):
+    """
+    Group the atoms of a slab into layers along the stacking direction.
+
+    A trilayer with the defect in one layer has three inequivalent classes of
+    atom, and in a 2D material their screening environments differ strongly:
+    the field an atom sees depends on whether it shares the defect's layer, not
+    only on how far away it is. Fitting one radial amplitude across all layers
+    conflates them, so the layer index is worth reporting alongside the fit.
+
+    Layers are found by projecting onto the unit normal of the a1-a2 plane and
+    grouping heights that differ by less than `tolerance`.
+
+    Returns:
+        layers (N,) int, numbered from the lowest layer upward.
+    """
+    lattice = np.asarray(lattice, dtype=float)
+    positions = np.asarray(positions, dtype=float)
+
+    normal = np.cross(lattice[0], lattice[1])
+    normal = normal / np.linalg.norm(normal)
+    height = positions @ normal
+
+    order = np.argsort(height)
+    layers = np.zeros(height.shape[0], dtype=int)
+    current = 0
+    layers[order[0]] = 0
+    for prev, this in zip(order[:-1], order[1:]):
+        if height[this] - height[prev] > float(tolerance):
+            current += 1
+        layers[this] = current
+    return layers
+
+
 def enforce_force_sum_rule(dF):
     """
     Re-impose the acoustic (translational) sum rule sum_a dF_a = 0.
@@ -806,12 +996,23 @@ def _fit_radial_amplitude(dF_rad, r):
     n = int(r.size)
     if n == 0:
         return {
-            "n_atoms": 0, "amplitude_eVA": 0.0, "r_squared": float("nan"),
+            "n_atoms": 0, "amplitude_eVA": 0.0, "amplitude_mean_eVA": 0.0,
+            "amplitude_median_eVA": 0.0, "amplitude_spread_percent": float("nan"),
+            "r_squared": float("nan"),
             "loglog_exponent": float("nan"), "n_sign_consistent": 0,
         }
 
+    # Three estimators of the same amplitude. Ordinary least squares on
+    # y = A r^-2 weights each atom by r^-4, so the innermost shell of a wide
+    # window carries most of the fit; the per-atom estimate A_a = y_a r_a^2
+    # weights every atom equally, and its median is insensitive to outliers.
+    # If the 1/r^2 model holds, all three agree. If they do not, the spread is
+    # the honest uncertainty on A and the model is the thing at fault.
     x = r ** -2.0
     amplitude = float(np.sum(dF_rad * x) / np.sum(x ** 2))
+    per_atom = dF_rad * r ** 2
+    amplitude_mean = float(np.mean(per_atom))
+    amplitude_median = float(np.median(per_atom))
 
     ss_res = float(np.sum((dF_rad - amplitude * x) ** 2))
     ss_tot = float(np.sum((dF_rad - np.mean(dF_rad)) ** 2))
@@ -831,6 +1032,13 @@ def _fit_radial_amplitude(dF_rad, r):
     return {
         "n_atoms": n,
         "amplitude_eVA": amplitude,
+        "amplitude_mean_eVA": amplitude_mean,
+        "amplitude_median_eVA": amplitude_median,
+        "amplitude_spread_percent": (
+            100.0 * (max(amplitude, amplitude_mean, amplitude_median)
+                     - min(amplitude, amplitude_mean, amplitude_median)) / abs(amplitude)
+            if amplitude != 0.0 else float("nan")
+        ),
         "r_squared": r_squared,
         "loglog_exponent": exponent,
         "n_sign_consistent": int(np.sum(same_sign)),
@@ -1006,6 +1214,9 @@ def fit_monopole_tail(
             "n_atoms_in_window": n_sel,
             "n_unmatched": n_unmatched_s,
             "amplitude_eVA": fit["amplitude_eVA"],
+            "amplitude_mean_eVA": fit["amplitude_mean_eVA"],
+            "amplitude_median_eVA": fit["amplitude_median_eVA"],
+            "amplitude_spread_percent": fit["amplitude_spread_percent"],
             "r_squared": fit["r_squared"],
             "loglog_exponent": fit["loglog_exponent"],
             "n_sign_consistent": fit["n_sign_consistent"],
@@ -1157,6 +1368,27 @@ def fit_monopole_tail(
                 "which is the signature of reference-image contamination. Move r_fit inward."
             )
 
+    # ---- layer-resolved diagnostic ----------------------------------------
+    # Pure reporting: it does not change the amplitudes used for the fill.
+    layers = layer_indices(lattice, positions)
+    defect_layer = int(layers[int(defect_index)])
+    per_species_layer = {}
+    for s in unique_species:
+        if per_species[s]["skipped"]:
+            continue
+        rows = []
+        for L in sorted(set(layers.tolist())):
+            sel_L = in_window & (species == s) & (layers == L)
+            n_L = int(np.sum(sel_L))
+            row = {"layer": L, "relative_to_defect": L - defect_layer, "n_atoms": n_L}
+            if n_L >= 3:
+                row.update(_fit_radial_amplitude(dF_rad[sel_L], r[sel_L]))
+            else:
+                row.update({"amplitude_eVA": float("nan"), "r_squared": float("nan"),
+                            "loglog_exponent": float("nan")})
+            rows.append(row)
+        per_species_layer[s] = rows
+
     fitted = [s for s in unique_species if not per_species[s]["skipped"]]
     sel_all = in_window & np.isin(species.astype(str), np.array([str(s) for s in fitted]))
     positive = sel_all & (np.abs(dF_rad) > 0)
@@ -1220,6 +1452,9 @@ def fit_monopole_tail(
         "drift_percent": drift_percent,
         "sub_window_drift_verdict": drift_verdict,
         "skipped_species": skipped_species,
+        "per_species_layer": per_species_layer,
+        "defect_layer": defect_layer,
+        "n_layers": int(len(set(layers.tolist()))),
         "per_species": per_species,
         "combined_loglog_exponent": exponent_all,
         "ratio_A_B_over_A_N": ratio_B_over_N,
@@ -1482,6 +1717,11 @@ def print_monopole_tail_summary(info):
                 f"    {str(s):<9}{d['n_atoms_in_window']:>7}{d['amplitude_eVA']:>15.6f}"
                 f"{d['r_squared']:>10.4f}{d['loglog_exponent']:>11.3f}"
             )
+            print(
+                f"    {'':<9}{'estimators':>7}  least squares {d['amplitude_eVA']:.4f} | "
+                f"mean {d['amplitude_mean_eVA']:.4f} | median {d['amplitude_median_eVA']:.4f}"
+                f"   spread {d['amplitude_spread_percent']:.1f}%"
+            )
     print("")
     print("  sub-window drift of A  (is one amplitude enough?)")
     print(f"    {'species':<9}{'window [A]':>14}{'N':>6}{'A [eV*A]':>15}{'R^2':>9}{'exponent':>11}")
@@ -1505,6 +1745,17 @@ def print_monopole_tail_summary(info):
                 line += f", {extra:+.1f}% extrapolated to {fit['extrapolation_radius_A']:.1f} A"
             print(line + ")")
     print(f"    verdict: {fit['sub_window_drift_verdict']}")
+    print("")
+    if fit.get("n_layers", 1) > 1:
+        print("")
+        print(f"  layer-resolved fit  ({fit['n_layers']} layers, defect in layer "
+              f"{fit['defect_layer']})")
+        print(f"    {'species':<9}{'layer':>8}{'N':>7}{'A [eV*A]':>15}{'R^2':>10}{'exponent':>11}")
+        for s, rows in fit.get("per_species_layer", {}).items():
+            for row in rows:
+                tag = f"{row['relative_to_defect']:+d}" if row["relative_to_defect"] else "defect"
+                print(f"    {str(s):<9}{tag:>8}{row['n_atoms']:>7}{row['amplitude_eVA']:>15.6f}"
+                      f"{row['r_squared']:>10.4f}{row['loglog_exponent']:>11.3f}")
     print("")
     print(f"  combined log-log exponent : {fit['combined_loglog_exponent']:.3f}  (expect ~ -2)")
     print(f"  A_B / A_N                 : {fit['ratio_A_B_over_A_N']:.3f}  (expect ~ -1)")
@@ -1837,6 +2088,8 @@ def CalculateSpectrum(
     tail_fit_window=(6.0, 16.0),
     tail_delta_q=None,               # +1 for C_B, -1 for C_N; 0 is rejected (no monopole)
     enforce_sum_rule=False,          # re-impose sum_a dF_a = 0 even without a tail (control)
+    # "warn" prints and continues, so results are unchanged; "raise" stops; "off" skips.
+    phonon_species_check="warn",
 ):
     pl = Photoluminescence()
 
@@ -1894,6 +2147,16 @@ def CalculateSpectrum(
                     F_gs,
                     title="SYNTHETIC OUTCAR GS (force-embedded, shared index map)",
                 )
+
+            if phonon_species_check != "off":
+                species_check = check_phonon_species_order(path_phonon_band, reference_poscar)
+                if not species_check["ok"]:
+                    message = phonon_species_order_message(
+                        path_phonon_band, reference_poscar, species_check
+                    )
+                    if phonon_species_check == "raise":
+                        raise ValueError(message)
+                    print(f"[PHONON/TARGET MISMATCH WARNING]\n{message}")
 
             print(f"[Embedding shared map from {embed_mapping_reference.upper()}]", mapping_info)
 
