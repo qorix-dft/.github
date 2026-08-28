@@ -692,8 +692,9 @@ def fit_monopole_tail(
     min_atoms_per_species=20,
     min_matched_r_max=18.0,
     exponent_bounds=(-2.4, -1.6),
-    sub_windows=((6.0, 9.0), (9.0, 12.0), (12.0, 16.0)),
+    drift_windows=None,
     sub_window_min_atoms=8,
+    extrapolation_radius=None,
     drift_tolerance_percent=5.0,
     drift_noise_floor_percent=1.0,
     exact_minimum_image=True,
@@ -801,6 +802,7 @@ def fit_monopole_tail(
 
     amplitudes = {}
     per_species = {}
+    skipped_species = []
     for s in unique_species:
         is_s = species == s
         sel = in_window & is_s
@@ -808,14 +810,27 @@ def fit_monopole_tail(
         n_unmatched_s = int(np.sum(unmatched & is_s))
 
         if n_sel < int(min_atoms_per_species):
+            # A species with too little to fit is only a problem if it also has
+            # atoms in the fill region, since that is the only place a missing
+            # amplitude would corrupt the result. The defect species is the
+            # ordinary case: the single carbon of a C_B or C_N monomer sits at
+            # r = 0, so it is in no shell and needs no amplitude. With no fill
+            # region at all -- a self-fit diagnostic -- nothing can raise here.
             if n_unmatched_s > 0:
                 raise ValueError(
                     f"Species '{s}' has only {n_sel} matched atoms in the fit window "
                     f"[{r_lo:.2f}, {r_hi:.2f}) A (need >= {int(min_atoms_per_species)}), "
-                    f"but {n_unmatched_s} of its atoms are unmatched and would need an "
-                    "analytic tail fitted from that window. Widen r_fit or use a larger "
+                    f"but {n_unmatched_s} of its atoms are in the fill region and would be "
+                    "given a tail fitted from that window. Widen r_fit or use a larger "
                     "reference; do not fit an amplitude from this few atoms."
                 )
+            reason = (
+                "no atoms in the fit window"
+                if n_sel == 0
+                else f"only {n_sel} atoms in the fit window, below the "
+                     f"{int(min_atoms_per_species)} minimum"
+            )
+            skipped_species.append((str(s), reason))
             amplitudes[s] = 0.0
             per_species[s] = {
                 "n_atoms_in_window": n_sel,
@@ -824,6 +839,7 @@ def fit_monopole_tail(
                 "r_squared": float("nan"),
                 "loglog_exponent": float("nan"),
                 "skipped": True,
+                "skip_reason": reason,
             }
             continue
 
@@ -850,15 +866,31 @@ def fit_monopole_tail(
     # r means the reference cell's own periodic images are pulling the outer
     # shells down, and the window must move inward.
     fill_r_max = float(np.max(r[unmatched])) if np.any(unmatched) else 0.0
-    requested_sub = [
-        (float(lo), float(hi)) for lo, hi in (sub_windows or ()) if lo >= r_lo and hi <= r_hi
-    ]
-    if len(requested_sub) < 2:
+    if extrapolation_radius is None:
+        extrap_r = fill_r_max
+        extrap_label = "the outermost filled atom"
+    else:
+        extrap_r = float(extrapolation_radius)
+        extrap_label = "the requested radius"
+
+    if drift_windows is None:
         edges = np.linspace(r_lo, r_hi, 4)
         requested_sub = [(float(edges[i]), float(edges[i + 1])) for i in range(3)]
-        sub_windows_are_default = False
+        drift_windows_explicit = False
     else:
-        sub_windows_are_default = True
+        requested_sub = [(float(lo), float(hi)) for lo, hi in drift_windows]
+        if not requested_sub:
+            raise ValueError("drift_windows is empty; pass None for three equal shells of r_fit.")
+        for lo, hi in requested_sub:
+            if hi <= lo:
+                raise ValueError(f"drift_windows entry ({lo}, {hi}) is not an increasing interval.")
+            if lo < r_lo - 1e-9 or hi > r_hi + 1e-9:
+                raise ValueError(
+                    f"drift_windows entry ({lo:.2f}, {hi:.2f}) A falls outside the effective fit "
+                    f"window [{r_lo:.2f}, {r_hi:.2f}) A. Sub-windows must be refits of the same "
+                    "data the global amplitude came from, or the drift is not comparable to it."
+                )
+        drift_windows_explicit = True
 
     drift_percent = {}
     for s in unique_species:
@@ -904,10 +936,10 @@ def fit_monopole_tail(
             # measured inside the window understates the error at the far edge.
             # A straight line through the shell amplitudes, extrapolated to the
             # outermost filled atom, bounds it.
-            if fill_r_max > 0 and len(usable) >= 2:
+            if extrap_r > 0 and len(usable) >= 2:
                 centres = np.array([0.5 * (e["r_lo_A"] + e["r_hi_A"]) for e in usable])
                 slope, intercept = np.polyfit(centres, values, 1)
-                extrapolated = 100.0 * (slope * fill_r_max + intercept - 1.0)
+                extrapolated = 100.0 * (slope * extrap_r + intercept - 1.0)
         else:
             d = float("nan")
 
@@ -926,7 +958,7 @@ def fit_monopole_tail(
         monotone = per_species[worst_species].get("drift_monotone", False)
         extrap = per_species[worst_species].get("drift_extrapolated_percent", float("nan"))
         extrap_note = (
-            f"; extrapolated to the outermost filled atom at {fill_r_max:.1f} A that is "
+            f"; extrapolated to {extrap_label} at {extrap_r:.1f} A that is "
             f"{extrap:+.1f}%"
             if np.isfinite(extrap)
             else ""
@@ -1026,9 +1058,11 @@ def fit_monopole_tail(
         "orthogonal_lattice": bool(is_orthogonal_lattice(lattice)),
         "n_images_refined": n_refined,
         "sub_windows_A": requested_sub,
-        "sub_windows_are_requested": sub_windows_are_default,
+        "drift_windows_explicit": drift_windows_explicit,
+        "extrapolation_radius_A": extrap_r,
         "drift_percent": drift_percent,
         "sub_window_drift_verdict": drift_verdict,
+        "skipped_species": skipped_species,
         "per_species": per_species,
         "combined_loglog_exponent": exponent_all,
         "ratio_A_B_over_A_N": ratio_B_over_N,
@@ -1284,7 +1318,8 @@ def print_monopole_tail_summary(info):
     print(f"    {'species':<9}{'N_fit':>7}{'A [eV*A]':>15}{'R^2':>10}{'exponent':>11}")
     for s, d in fit["per_species"].items():
         if d["skipped"]:
-            print(f"    {str(s):<9}{d['n_atoms_in_window']:>7}{'skipped (no unmatched atoms)':>36}")
+            print(f"    {str(s):<9}{d['n_atoms_in_window']:>7}"
+                  f"{'skipped: ' + d.get('skip_reason', 'nothing to fit'):>44}")
         else:
             print(
                 f"    {str(s):<9}{d['n_atoms_in_window']:>7}{d['amplitude_eVA']:>15.6f}"
@@ -1310,7 +1345,7 @@ def print_monopole_tail_summary(info):
             extra = d.get("drift_extrapolated_percent", float("nan"))
             line = f"    {str(s):<9}{'drift':>14}{'':>6}{d['drift_percent']:>14.1f}%  ({tag}"
             if np.isfinite(extra):
-                line += f", {extra:+.1f}% extrapolated to the fill edge"
+                line += f", {extra:+.1f}% extrapolated to {fit['extrapolation_radius_A']:.1f} A"
             print(line + ")")
     print(f"    verdict: {fit['sub_window_drift_verdict']}")
     print("")
