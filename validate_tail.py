@@ -150,6 +150,8 @@ def build_difference_force(outcar_es, outcar_gs, target_poscar, mode, args):
             defect_index=args.defect_index,
             fit_window=(args.fit_lo, args.fit_hi),
             enforce_sum_rule=True,
+            layer_resolved=args.layer_resolved,
+            fill_zero_mean=args.fill_zero_mean,
             verbose=True,
         )
     elif mode != "raw":
@@ -221,6 +223,17 @@ def main():
     parser.add_argument("--tolerance", type=float, default=EMBED_TOLERANCE)
     parser.add_argument("--sigma", type=float, default=SIGMA_MEV)
     parser.add_argument("--n-q", type=int, default=N_Q_SMALLEST)
+    parser.add_argument(
+        "--layer-resolved",
+        action="store_true",
+        help="fit and fill one amplitude per species AND layer, instead of one per species",
+    )
+    parser.add_argument(
+        "--fill-zero-mean",
+        action="store_true",
+        help="remove each group's mean over the filled atoms so the fill contributes no net "
+             "force and no mass-weighted q=0 component; truncation already gets q=0 right",
+    )
     parser.add_argument(
         "--no-align-defects",
         dest="align_defects",
