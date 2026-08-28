@@ -163,6 +163,7 @@ def build_unit_to_target_force_mapping(
     pbc=True,
     bijective=True,
     unit_poscar_for_species_check=None,
+    unit_position_shift=None,
 ):
     """
     Build one atom-index mapping from a small/unit OUTCAR into a large target POSCAR.
@@ -172,6 +173,18 @@ def build_unit_to_target_force_mapping(
                         target_to_unit[i] is the matching unit atom index, or -1 if unmatched.
         target_positions: (N_target,3) cartesian positions from target POSCAR, in target order.
         mapping_info: dict with matching statistics.
+
+    unit_position_shift:
+        Optional constant vector (3,) in A added to every unit position before
+        matching. Use it when the reference and the target place the defect on
+        different sites of the same host lattice: two supercells of one material
+        differing only in which atom was substituted have the same host lattice
+        but different species blocks, so they will not match atom for atom until
+        one is translated onto the other. A rigid translation does not rotate
+        anything, so the forces themselves transfer unchanged; anything needing
+        a rotation or a different cell shape will simply fail to match, and the
+        returned statistics will say so. Use defect_alignment_shift to derive
+        the vector. Default None leaves matching exactly as before.
 
     Important:
       - The returned target_to_unit array is in the target POSCAR ordering.
@@ -192,6 +205,12 @@ def build_unit_to_target_force_mapping(
 
     unit_counts = extract_ions_per_type(unit_outcar)
     unit_pos, _ = read_last_total_force_block(unit_outcar)
+
+    if unit_position_shift is not None:
+        shift_vector = np.asarray(unit_position_shift, dtype=float).reshape(3)
+        unit_pos = unit_pos + shift_vector[None, :]
+    else:
+        shift_vector = np.zeros(3)
 
     if sum(unit_counts) != unit_pos.shape[0]:
         raise ValueError(
@@ -268,9 +287,147 @@ def build_unit_to_target_force_mapping(
         "max_match_distance_A": max_distance,
         "n_target": super_pos.shape[0],
         "n_unit": unit_pos.shape[0],
+        "unit_position_shift_A": shift_vector,
+        "unit_position_shift_norm_A": float(np.linalg.norm(shift_vector)),
     }
 
     return target_to_unit, super_pos, info
+
+
+def defect_alignment_shift(
+    unit_outcar,
+    target_poscar,
+    unit_species_order=None,
+    unit_defect_index=None,
+    target_defect_index=None,
+):
+    """
+    Rigid translation that puts the reference cell's defect on the target's defect.
+
+    A substitutional defect does not change the host lattice, only which site
+    carries the impurity. Two supercells of the same material that substituted
+    different sites therefore have identical atomic positions but different
+    species blocks: the target's carbon site is a boron in the reference and
+    vice versa, so a direct atom-for-atom match fails on exactly those sites and
+    on everything the differing defect environments displace.
+
+    Translating the whole reference by the vector between the two defect
+    positions fixes that, because the host lattice maps onto itself under a
+    lattice translation and the substituted sublattice maps onto itself. The
+    translation is rigid, so forces are carried across unchanged -- no rotation
+    is applied and none is inferred. Whether the two cells really are related
+    this way is not assumed: it is tested by the mapping that follows, which
+    reports how many target atoms were matched and how far.
+
+    Returns:
+        shift (3,) in A, info dict with the two defect indices and species.
+    """
+    lattice, target_species, target_counts, target_pos = read_poscar(target_poscar)
+    unit_counts = extract_ions_per_type(unit_outcar)
+    unit_pos, _ = read_last_total_force_block(unit_outcar)
+
+    if sum(unit_counts) != unit_pos.shape[0]:
+        raise ValueError(
+            f"Unit OUTCAR ions-per-type sum ({sum(unit_counts)}) != "
+            f"TOTAL-FORCE atom count ({unit_pos.shape[0]})."
+        )
+    if len(unit_counts) != len(target_counts):
+        raise ValueError(
+            "Different number of species types between unit OUTCAR and target POSCAR.\n"
+            f"Unit (ions per type): {unit_counts}\n"
+            f"Target (POSCAR):      {target_counts}"
+        )
+
+    unit_species = list(unit_species_order) if unit_species_order is not None else list(target_species)
+
+    if target_defect_index is None:
+        target_defect_index, target_label = locate_minority_species_atom(
+            target_species, target_counts
+        )
+    else:
+        target_defect_index = int(target_defect_index)
+        target_label = str(species_labels_from_counts(target_species, target_counts)[target_defect_index])
+
+    if unit_defect_index is None:
+        unit_defect_index, unit_label = locate_minority_species_atom(unit_species, unit_counts)
+    else:
+        unit_defect_index = int(unit_defect_index)
+        unit_label = str(species_labels_from_counts(unit_species, unit_counts)[unit_defect_index])
+
+    if str(unit_label) != str(target_label):
+        raise ValueError(
+            f"Defect species differ: reference has '{unit_label}', target has '{target_label}'. "
+            "A rigid translation can only align the same defect in two cells."
+        )
+
+    raw = target_pos[target_defect_index] - unit_pos[unit_defect_index]
+    shift = minimum_image_displacement(lattice, raw)
+
+    info = {
+        "unit_defect_index": unit_defect_index,
+        "target_defect_index": target_defect_index,
+        "defect_species": str(target_label),
+        "shift_A": shift,
+        "shift_norm_A": float(np.linalg.norm(shift)),
+        "shift_before_wrapping_A": raw,
+    }
+    return shift, info
+
+
+def verify_defect_correspondence(
+    target_to_unit,
+    unit_outcar,
+    target_poscar,
+    unit_species_order=None,
+    unit_defect_index=None,
+    target_defect_index=None,
+):
+    """
+    Check that the target's defect atom is matched to the reference's defect atom.
+
+    This is the one test that catches a reference embedded around the wrong site,
+    and it is needed because the obvious test does not. Two 15x9 cells that
+    substituted different sites of the same host lattice differ in only two
+    atoms: each cell's defect site is an ordinary host atom in the other. Matching
+    them without a translation therefore leaves just 2 of 1620 target atoms
+    unmatched, every one of the other 1618 matching at a distance of ~0 A, while
+    the embedded difference force field is centred on the wrong site and is
+    ~140% wrong. Unmatched counts and match distances are both nearly blind to
+    it; the defect correspondence is not.
+
+    Returns:
+        dict with 'ok' and the three indices involved.
+    """
+    target_to_unit = np.asarray(target_to_unit, dtype=int)
+    _, target_species, target_counts, _ = read_poscar(target_poscar)
+    unit_counts = extract_ions_per_type(unit_outcar)
+    unit_species = (
+        list(unit_species_order) if unit_species_order is not None else list(target_species)
+    )
+
+    if target_defect_index is None:
+        target_defect_index, target_label = locate_minority_species_atom(
+            target_species, target_counts
+        )
+    else:
+        target_defect_index = int(target_defect_index)
+        target_label = str(
+            species_labels_from_counts(target_species, target_counts)[target_defect_index]
+        )
+    if unit_defect_index is None:
+        unit_defect_index, _ = locate_minority_species_atom(unit_species, unit_counts)
+    else:
+        unit_defect_index = int(unit_defect_index)
+
+    mapped = int(target_to_unit[target_defect_index])
+    return {
+        "ok": mapped == int(unit_defect_index),
+        "target_defect_index": target_defect_index,
+        "unit_defect_index": int(unit_defect_index),
+        "mapped_unit_index": mapped,
+        "defect_species": str(target_label),
+        "defect_unmatched": mapped < 0,
+    }
 
 
 def apply_force_embedding_mapping(unit_outcar, target_to_unit):
@@ -492,28 +649,49 @@ def minimum_image_radius(lattice, positions=None):
     return 0.5 * min(widths)
 
 
+def is_orthogonal_lattice(lattice, tolerance=1e-8):
+    """
+    True if the lattice vectors are mutually orthogonal.
+
+    Checked on the normalised off-diagonal terms of the metric tensor, so it is
+    scale free. The production h-BN cells are the rectangular 4-atom
+    representation (b = sqrt(3) a) and are strictly orthorhombic; the primitive
+    hexagonal-vector representation is not.
+    """
+    lattice = np.asarray(lattice, dtype=float)
+    metric = lattice @ lattice.T
+    norms = np.sqrt(np.diag(metric))
+    for i in range(3):
+        for j in range(i + 1, 3):
+            if abs(metric[i, j]) / (norms[i] * norms[j]) > float(tolerance):
+                return False
+    return True
+
+
 def defect_displacements(lattice, positions, defect_index, exact_minimum_image=True):
     """
     Displacements of every atom from the defect, under the true minimum image.
 
     This starts from the existing minimum_image_displacement, which wraps the
-    fractional coordinates by rounding. That rule gives the true nearest image
-    only for cells whose Voronoi region coincides with the fractional
-    parallelepiped -- essentially orthogonal cells. For the 120 degree cell of
-    h-BN it does not: on a 15x9 target, 21.5% of the atoms in a 6-16 A window
-    are assigned a periodic image that is not the nearest one, and where it
-    errs the two candidate r_hat differ by a median of 87 degrees, i.e. they
-    are nearly perpendicular.
+    fractional coordinates by rounding. For an ORTHOGONAL lattice that rule is
+    provably exact: the axes do not mix, so minimising |dx|, |dy| and |dz|
+    independently minimises the norm. The production cells are orthorhombic, so
+    the refinement below is a no-op on them and is asserted to be one.
 
-    That matters here in a way it does not for atom matching, which only needs
-    to know whether a distance is below ~0.09 A. The monopole fit and fill need
-    r and r_hat themselves, so the wrapped displacement is refined by searching
-    the 27 nearest periodic images and keeping the shortest. Set
-    exact_minimum_image=False to reproduce the plain rounding rule.
+    It is not exact for a general cell, where the Voronoi region does not
+    coincide with the fractional parallelepiped. In the primitive
+    hexagonal-vector representation of the same material, rounding misassigns
+    about a fifth of the atoms in a 6-16 A window, and where it errs the two
+    candidate r_hat are close to perpendicular. That would not matter for atom
+    matching, which only asks whether a distance is below ~0.09 A, but the
+    monopole fit and fill need r and r_hat themselves. So the wrapped
+    displacement is refined by searching the 27 nearest periodic images and
+    keeping the shortest, which costs nothing and is correct for either cell
+    choice. Set exact_minimum_image=False to reproduce the plain rounding rule.
 
     Returns:
         R (N,3) displacements in A, r (N,) their norms, n_refined (int) the
-        number of atoms whose image the refinement changed.
+        number of atoms whose distance the refinement actually shortened.
     """
     lattice = np.asarray(lattice, dtype=float)
     positions = np.asarray(positions, dtype=float)
@@ -522,15 +700,33 @@ def defect_displacements(lattice, positions, defect_index, exact_minimum_image=T
 
     n_refined = 0
     if exact_minimum_image:
+        r_rounded = np.linalg.norm(R, axis=1)
         shifts = np.array(
             [[i, j, k] for i in (-1, 0, 1) for j in (-1, 0, 1) for k in (-1, 0, 1)],
             dtype=float,
         ) @ lattice
-        identity = 13  # index of the (0,0,0) shift in the list above
         candidates = R[:, None, :] + shifts[None, :, :]
-        best = np.argmin(np.einsum("nsx,nsx->ns", candidates, candidates), axis=1)
-        n_refined = int(np.sum(best != identity))
+        d2 = np.einsum("nsx,nsx->ns", candidates, candidates)
+        best = np.argmin(d2, axis=1)
         R = candidates[np.arange(R.shape[0]), best]
+        r_exact = np.linalg.norm(R, axis=1)
+
+        # Count only genuine shortenings. An atom exactly on a cell face has two
+        # equidistant images and the search may return the other one; that is a
+        # tie, not a refinement.
+        scale = max(float(np.max(r_rounded)), 1.0)
+        n_refined = int(np.sum(r_rounded - r_exact > 1e-9 * scale))
+
+        if is_orthogonal_lattice(lattice):
+            worst = float(np.max(np.abs(r_rounded - r_exact)))
+            if worst > 1e-9 * scale:
+                raise ValueError(
+                    "Internal error: on an orthogonal lattice the 27-image search must agree "
+                    "with fractional rounding to machine precision, because minimising each "
+                    f"coordinate independently minimises the norm. Largest disagreement "
+                    f"{worst:.3e} A over {n_refined} atoms. This is a bug in the image search, "
+                    "not a correction to the rounding rule."
+                )
 
     return R, np.linalg.norm(R, axis=1), n_refined
 
@@ -539,13 +735,12 @@ def image_ambiguity(lattice, positions, defect_index, atom_mask=None, tolerance=
     """
     Count atoms for which "the" nearest periodic image of the defect is ambiguous.
 
-    Beyond the minimum-image radius the defect's monopole field overlaps its own
-    periodic images, and two or more images can be equidistant to within
-    numerical noise. The analytic fill picks one of them, so its direction r_hat
-    there is arbitrary at the level of the degeneracy: on a Wigner-Seitz face the
-    two candidates are related by a symmetry operation and their fields differ by
-    a large angle. This does not affect atoms inside the minimum-image radius,
-    where the nearest image is unique by construction.
+    Beyond the minimum-image radius two or more images of the defect can be
+    equidistant to within numerical noise. The fill points away from one of them,
+    so its direction r_hat there is arbitrary at the level of the degeneracy: on
+    a cell face the two candidates are related by a symmetry operation and their
+    fields differ by a large angle. This does not affect atoms inside the
+    minimum-image radius, where the nearest image is unique by construction.
 
     Returns:
         n_ambiguous: atoms whose second-nearest image is within `tolerance`
@@ -597,6 +792,51 @@ def enforce_force_sum_rule(dF):
     return dF_corrected, stats
 
 
+def _fit_radial_amplitude(dF_rad, r):
+    """
+    One zero-intercept least squares fit of dF_rad against r^-2.
+
+    A = sum(dF_rad * r^-2) / sum(r^-4), plus the R^2 of that fit and an
+    independent log-log slope, which is the honest test of the assumed
+    exponent. Shared by the full-window fit and the sub-window drift test so
+    the two can never disagree on method.
+    """
+    dF_rad = np.asarray(dF_rad, dtype=float)
+    r = np.asarray(r, dtype=float)
+    n = int(r.size)
+    if n == 0:
+        return {
+            "n_atoms": 0, "amplitude_eVA": 0.0, "r_squared": float("nan"),
+            "loglog_exponent": float("nan"), "n_sign_consistent": 0,
+        }
+
+    x = r ** -2.0
+    amplitude = float(np.sum(dF_rad * x) / np.sum(x ** 2))
+
+    ss_res = float(np.sum((dF_rad - amplitude * x) ** 2))
+    ss_tot = float(np.sum((dF_rad - np.mean(dF_rad)) ** 2))
+    r_squared = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+
+    same_sign = (
+        dF_rad * np.sign(amplitude) > 0
+        if amplitude != 0.0
+        else np.zeros_like(dF_rad, dtype=bool)
+    )
+    if int(np.sum(same_sign)) >= 3:
+        slope, _ = np.polyfit(np.log(r[same_sign]), np.log(np.abs(dF_rad[same_sign])), 1)
+        exponent = float(slope)
+    else:
+        exponent = float("nan")
+
+    return {
+        "n_atoms": n,
+        "amplitude_eVA": amplitude,
+        "r_squared": r_squared,
+        "loglog_exponent": exponent,
+        "n_sign_consistent": int(np.sum(same_sign)),
+    }
+
+
 def fit_monopole_tail(
     dF,
     positions,
@@ -609,6 +849,11 @@ def fit_monopole_tail(
     min_atoms_per_species=20,
     min_matched_r_max=18.0,
     exponent_bounds=(-2.4, -1.6),
+    drift_windows=None,
+    sub_window_min_atoms=8,
+    extrapolation_radius=None,
+    drift_tolerance_percent=5.0,
+    drift_noise_floor_percent=1.0,
     exact_minimum_image=True,
     verbose=True,
 ):
@@ -714,6 +959,7 @@ def fit_monopole_tail(
 
     amplitudes = {}
     per_species = {}
+    skipped_species = []
     for s in unique_species:
         is_s = species == s
         sel = in_window & is_s
@@ -721,14 +967,27 @@ def fit_monopole_tail(
         n_unmatched_s = int(np.sum(unmatched & is_s))
 
         if n_sel < int(min_atoms_per_species):
+            # A species with too little to fit is only a problem if it also has
+            # atoms in the fill region, since that is the only place a missing
+            # amplitude would corrupt the result. The defect species is the
+            # ordinary case: the single carbon of a C_B or C_N monomer sits at
+            # r = 0, so it is in no shell and needs no amplitude. With no fill
+            # region at all -- a self-fit diagnostic -- nothing can raise here.
             if n_unmatched_s > 0:
                 raise ValueError(
                     f"Species '{s}' has only {n_sel} matched atoms in the fit window "
                     f"[{r_lo:.2f}, {r_hi:.2f}) A (need >= {int(min_atoms_per_species)}), "
-                    f"but {n_unmatched_s} of its atoms are unmatched and would need an "
-                    "analytic tail fitted from that window. Widen r_fit or use a larger "
+                    f"but {n_unmatched_s} of its atoms are in the fill region and would be "
+                    "given a tail fitted from that window. Widen r_fit or use a larger "
                     "reference; do not fit an amplitude from this few atoms."
                 )
+            reason = (
+                "no atoms in the fit window"
+                if n_sel == 0
+                else f"only {n_sel} atoms in the fit window, below the "
+                     f"{int(min_atoms_per_species)} minimum"
+            )
+            skipped_species.append((str(s), reason))
             amplitudes[s] = 0.0
             per_species[s] = {
                 "n_atoms_in_window": n_sel,
@@ -737,36 +996,166 @@ def fit_monopole_tail(
                 "r_squared": float("nan"),
                 "loglog_exponent": float("nan"),
                 "skipped": True,
+                "skip_reason": reason,
             }
             continue
 
-        r_s = r[sel]
-        y_s = dF_rad[sel]
-        x_s = r_s ** -2.0
-        A_s = float(np.sum(y_s * x_s) / np.sum(x_s ** 2))
-
-        model = A_s * x_s
-        ss_res = float(np.sum((y_s - model) ** 2))
-        ss_tot = float(np.sum((y_s - np.mean(y_s)) ** 2))
-        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
-
-        same_sign = (y_s * np.sign(A_s) > 0) if A_s != 0.0 else np.zeros_like(y_s, dtype=bool)
-        if int(np.sum(same_sign)) >= 3:
-            slope, _ = np.polyfit(np.log(r_s[same_sign]), np.log(np.abs(y_s[same_sign])), 1)
-            exponent_s = float(slope)
-        else:
-            exponent_s = float("nan")
-
-        amplitudes[s] = A_s
+        fit = _fit_radial_amplitude(dF_rad[sel], r[sel])
+        amplitudes[s] = fit["amplitude_eVA"]
         per_species[s] = {
             "n_atoms_in_window": n_sel,
             "n_unmatched": n_unmatched_s,
-            "amplitude_eVA": A_s,
-            "r_squared": r2,
-            "loglog_exponent": exponent_s,
-            "n_sign_consistent": int(np.sum(same_sign)),
+            "amplitude_eVA": fit["amplitude_eVA"],
+            "r_squared": fit["r_squared"],
+            "loglog_exponent": fit["loglog_exponent"],
+            "n_sign_consistent": fit["n_sign_consistent"],
             "skipped": False,
         }
+
+    # ---- sub-window drift -------------------------------------------------
+    # A single amplitude A only describes the field if A comes out the same
+    # wherever inside the window it is measured. Refitting A independently over
+    # consecutive shells tests exactly that, and the direction of any drift says
+    # which way the assumption fails. |A| growing with r means the effective
+    # screening is weakening outwards, which is what a q-dependent
+    # (Rytova-Keldysh) dielectric response does in a layered 2D system, and the
+    # single-parameter fill will then under-shoot at large r. |A| shrinking with
+    # r means the reference cell's own periodic images are pulling the outer
+    # shells down, and the window must move inward.
+    fill_r_max = float(np.max(r[unmatched])) if np.any(unmatched) else 0.0
+    if extrapolation_radius is None:
+        extrap_r = fill_r_max
+        extrap_label = "the outermost filled atom"
+    else:
+        extrap_r = float(extrapolation_radius)
+        extrap_label = "the requested radius"
+
+    if drift_windows is None:
+        edges = np.linspace(r_lo, r_hi, 4)
+        requested_sub = [(float(edges[i]), float(edges[i + 1])) for i in range(3)]
+        drift_windows_explicit = False
+    else:
+        requested_sub = [(float(lo), float(hi)) for lo, hi in drift_windows]
+        if not requested_sub:
+            raise ValueError("drift_windows is empty; pass None for three equal shells of r_fit.")
+        for lo, hi in requested_sub:
+            if hi <= lo:
+                raise ValueError(f"drift_windows entry ({lo}, {hi}) is not an increasing interval.")
+            if lo < r_lo - 1e-9 or hi > r_hi + 1e-9:
+                raise ValueError(
+                    f"drift_windows entry ({lo:.2f}, {hi:.2f}) A falls outside the effective fit "
+                    f"window [{r_lo:.2f}, {r_hi:.2f}) A. Sub-windows must be refits of the same "
+                    "data the global amplitude came from, or the drift is not comparable to it."
+                )
+        drift_windows_explicit = True
+
+    drift_percent = {}
+    for s in unique_species:
+        if per_species[s]["skipped"]:
+            per_species[s]["sub_windows"] = []
+            per_species[s]["drift_percent"] = float("nan")
+            continue
+
+        is_s = species == s
+        shells = []
+        for lo, hi in requested_sub:
+            sel_sub = matched & not_defect & is_s & (r >= lo) & (r < hi)
+            n_sub = int(np.sum(sel_sub))
+            entry = {"r_lo_A": lo, "r_hi_A": hi, "n_atoms": n_sub}
+            if n_sub >= int(sub_window_min_atoms):
+                entry.update(_fit_radial_amplitude(dF_rad[sel_sub], r[sel_sub]))
+                entry["sufficient"] = True
+            else:
+                entry.update(
+                    {"amplitude_eVA": float("nan"), "r_squared": float("nan"),
+                     "loglog_exponent": float("nan"), "sufficient": False}
+                )
+            shells.append(entry)
+
+        usable = [e for e in shells if e["sufficient"]]
+        A_global = per_species[s]["amplitude_eVA"]
+        monotone = False
+        extrapolated = float("nan")
+        if len(usable) >= 2 and A_global != 0.0:
+            # Positive means |A| grows with r, for either sign of A.
+            values = np.array([e["amplitude_eVA"] for e in usable]) / A_global
+            d = 100.0 * (values[-1] - values[0])
+
+            # Monotone only counts as a trend once the drift clears the noise
+            # floor; three amplitudes agreeing to 1e-6 are "monotone" by accident.
+            steps = np.diff(values)
+            monotone = bool(
+                (np.all(steps > 0) or np.all(steps < 0))
+                and abs(d) >= float(drift_noise_floor_percent)
+            )
+
+            # The fill region reaches further out than the fit window, so a drift
+            # measured inside the window understates the error at the far edge.
+            # A straight line through the shell amplitudes, extrapolated to the
+            # outermost filled atom, bounds it.
+            if extrap_r > 0 and len(usable) >= 2:
+                centres = np.array([0.5 * (e["r_lo_A"] + e["r_hi_A"]) for e in usable])
+                slope, intercept = np.polyfit(centres, values, 1)
+                extrapolated = 100.0 * (slope * extrap_r + intercept - 1.0)
+        else:
+            d = float("nan")
+
+        per_species[s]["sub_windows"] = shells
+        per_species[s]["drift_percent"] = d
+        per_species[s]["drift_monotone"] = monotone
+        per_species[s]["drift_extrapolated_percent"] = extrapolated
+        drift_percent[s] = d
+
+    finite_drift = {s: d for s, d in drift_percent.items() if np.isfinite(d)}
+    if not finite_drift:
+        drift_verdict = "not determined (too few atoms per sub-window)"
+    else:
+        worst_species = max(finite_drift, key=lambda s: abs(finite_drift[s]))
+        worst = finite_drift[worst_species]
+        monotone = per_species[worst_species].get("drift_monotone", False)
+        extrap = per_species[worst_species].get("drift_extrapolated_percent", float("nan"))
+        extrap_note = (
+            f"; extrapolated to {extrap_label} at {extrap_r:.1f} A that is "
+            f"{extrap:+.1f}%"
+            if np.isfinite(extrap)
+            else ""
+        )
+        if abs(worst) <= float(drift_tolerance_percent) and not monotone:
+            drift_verdict = (
+                f"flat to within {float(drift_tolerance_percent):.0f}% (largest |drift| "
+                f"{abs(worst):.1f}% on {worst_species}, no monotone trend above the "
+                f"{float(drift_noise_floor_percent):.0f}% noise floor): the single-parameter "
+                "A/r^2 form is sound"
+            )
+        elif abs(worst) <= float(drift_tolerance_percent):
+            drift_verdict = (
+                f"small but MONOTONE: {worst:+.1f}% on {worst_species} across the sub-windows"
+                f"{extrap_note}. Below the {float(drift_tolerance_percent):.0f}% tolerance, but a "
+                "monotone trend is a trend, not scatter -- quote the extrapolated figure as the "
+                "residual error rather than treating the fit as exact"
+            )
+        elif worst > 0:
+            drift_verdict = (
+                f"|A| GROWS with r by {worst:+.1f}% on {worst_species}"
+                f"{' (monotone)' if monotone else ''}: consistent with weakening screening, i.e. a "
+                f"q-dependent dielectric response; the fill under-shoots at large r{extrap_note}"
+            )
+            warnings.append(
+                f"sub-window drift {worst:+.1f}% on species {worst_species}: |A| grows outward, so "
+                "a single amplitude under-shoots the far field"
+                f"{extrap_note}. Quote that as the residual error, or move to a Rytova-Keldysh form."
+            )
+        else:
+            drift_verdict = (
+                f"|A| SHRINKS with r by {worst:+.1f}% on {worst_species}"
+                f"{' (monotone)' if monotone else ''}: consistent with the reference cell's own "
+                "periodic images pulling the outer shells down; move the fit window inward"
+                f"{extrap_note}"
+            )
+            warnings.append(
+                f"sub-window drift {worst:+.1f}% on species {worst_species}: |A| shrinks outward, "
+                "which is the signature of reference-image contamination. Move r_fit inward."
+            )
 
     fitted = [s for s in unique_species if not per_species[s]["skipped"]]
     sel_all = in_window & np.isin(species.astype(str), np.array([str(s) for s in fitted]))
@@ -823,7 +1212,14 @@ def fit_monopole_tail(
         "n_unmatched": int(np.sum(unmatched)),
         "n_atoms_in_window": int(np.sum(in_window)),
         "exact_minimum_image": bool(exact_minimum_image),
+        "orthogonal_lattice": bool(is_orthogonal_lattice(lattice)),
         "n_images_refined": n_refined,
+        "sub_windows_A": requested_sub,
+        "drift_windows_explicit": drift_windows_explicit,
+        "extrapolation_radius_A": extrap_r,
+        "drift_percent": drift_percent,
+        "sub_window_drift_verdict": drift_verdict,
+        "skipped_species": skipped_species,
         "per_species": per_species,
         "combined_loglog_exponent": exponent_all,
         "ratio_A_B_over_A_N": ratio_B_over_N,
@@ -1079,12 +1475,37 @@ def print_monopole_tail_summary(info):
     print(f"    {'species':<9}{'N_fit':>7}{'A [eV*A]':>15}{'R^2':>10}{'exponent':>11}")
     for s, d in fit["per_species"].items():
         if d["skipped"]:
-            print(f"    {str(s):<9}{d['n_atoms_in_window']:>7}{'skipped (no unmatched atoms)':>36}")
+            print(f"    {str(s):<9}{d['n_atoms_in_window']:>7}"
+                  f"{'skipped: ' + d.get('skip_reason', 'nothing to fit'):>44}")
         else:
             print(
                 f"    {str(s):<9}{d['n_atoms_in_window']:>7}{d['amplitude_eVA']:>15.6f}"
                 f"{d['r_squared']:>10.4f}{d['loglog_exponent']:>11.3f}"
             )
+    print("")
+    print("  sub-window drift of A  (is one amplitude enough?)")
+    print(f"    {'species':<9}{'window [A]':>14}{'N':>6}{'A [eV*A]':>15}{'R^2':>9}{'exponent':>11}")
+    for s, d in fit["per_species"].items():
+        if d["skipped"]:
+            continue
+        for e in d.get("sub_windows", []):
+            win = f"{e['r_lo_A']:.1f} - {e['r_hi_A']:.1f}"
+            if e["sufficient"]:
+                print(
+                    f"    {str(s):<9}{win:>14}{e['n_atoms']:>6}{e['amplitude_eVA']:>15.6f}"
+                    f"{e['r_squared']:>9.4f}{e['loglog_exponent']:>11.3f}"
+                )
+            else:
+                print(f"    {str(s):<9}{win:>14}{e['n_atoms']:>6}{'too few atoms':>35}")
+        if np.isfinite(d.get("drift_percent", float("nan"))):
+            tag = "monotone" if d.get("drift_monotone") else "scatter"
+            extra = d.get("drift_extrapolated_percent", float("nan"))
+            line = f"    {str(s):<9}{'drift':>14}{'':>6}{d['drift_percent']:>14.1f}%  ({tag}"
+            if np.isfinite(extra):
+                line += f", {extra:+.1f}% extrapolated to {fit['extrapolation_radius_A']:.1f} A"
+            print(line + ")")
+    print(f"    verdict: {fit['sub_window_drift_verdict']}")
+    print("")
     print(f"  combined log-log exponent : {fit['combined_loglog_exponent']:.3f}  (expect ~ -2)")
     print(f"  A_B / A_N                 : {fit['ratio_A_B_over_A_N']:.3f}  (expect ~ -1)")
     if fit["sign_check"] is not None:
@@ -1119,11 +1540,14 @@ def print_monopole_tail_summary(info):
     if app["n_atoms_filled"] and app["n_filled_beyond_minimum_image_radius"] > 0:
         extra.append(
             f"{app['n_filled_beyond_minimum_image_radius']} of {app['n_atoms_filled']} filled "
-            f"atoms lie beyond the minimum-image radius {app['minimum_image_radius_A']:.2f} A. "
-            "There the defect's monopole field overlaps its own periodic images, so a "
-            "single-image 1/r^2 fill is an approximation to the periodic lattice sum; "
-            f"for {app['n_filled_image_ambiguous']} of them the nearest image is degenerate "
-            "to within 2% and the fill direction is correspondingly arbitrary."
+            f"atoms lie beyond the minimum-image radius {app['minimum_image_radius_A']:.2f} A, "
+            "where the target's own periodicity would matter if it were physical. It is not: "
+            "the target supercell is a device for generating a dense phonon spectrum, and the "
+            "field being continued is that of one isolated defect, so a single-image fill is "
+            "what is wanted and a lattice sum would reintroduce the defect-image interaction "
+            f"this correction exists to remove. For {app['n_filled_image_ambiguous']} of them "
+            "two images are equidistant to within 2%, so which one the fill points away from "
+            "is arbitrary."
         )
     if extra:
         print("")
