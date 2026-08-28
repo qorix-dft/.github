@@ -922,6 +922,40 @@ def image_ambiguity(lattice, positions, defect_index, atom_mask=None, tolerance=
     return int(np.sum(rel < float(tolerance)))
 
 
+def layer_indices(lattice, positions, tolerance=1.0):
+    """
+    Group the atoms of a slab into layers along the stacking direction.
+
+    A trilayer with the defect in one layer has three inequivalent classes of
+    atom, and in a 2D material their screening environments differ strongly:
+    the field an atom sees depends on whether it shares the defect's layer, not
+    only on how far away it is. Fitting one radial amplitude across all layers
+    conflates them, so the layer index is worth reporting alongside the fit.
+
+    Layers are found by projecting onto the unit normal of the a1-a2 plane and
+    grouping heights that differ by less than `tolerance`.
+
+    Returns:
+        layers (N,) int, numbered from the lowest layer upward.
+    """
+    lattice = np.asarray(lattice, dtype=float)
+    positions = np.asarray(positions, dtype=float)
+
+    normal = np.cross(lattice[0], lattice[1])
+    normal = normal / np.linalg.norm(normal)
+    height = positions @ normal
+
+    order = np.argsort(height)
+    layers = np.zeros(height.shape[0], dtype=int)
+    current = 0
+    layers[order[0]] = 0
+    for prev, this in zip(order[:-1], order[1:]):
+        if height[this] - height[prev] > float(tolerance):
+            current += 1
+        layers[this] = current
+    return layers
+
+
 def enforce_force_sum_rule(dF):
     """
     Re-impose the acoustic (translational) sum rule sum_a dF_a = 0.
@@ -962,12 +996,23 @@ def _fit_radial_amplitude(dF_rad, r):
     n = int(r.size)
     if n == 0:
         return {
-            "n_atoms": 0, "amplitude_eVA": 0.0, "r_squared": float("nan"),
+            "n_atoms": 0, "amplitude_eVA": 0.0, "amplitude_mean_eVA": 0.0,
+            "amplitude_median_eVA": 0.0, "amplitude_spread_percent": float("nan"),
+            "r_squared": float("nan"),
             "loglog_exponent": float("nan"), "n_sign_consistent": 0,
         }
 
+    # Three estimators of the same amplitude. Ordinary least squares on
+    # y = A r^-2 weights each atom by r^-4, so the innermost shell of a wide
+    # window carries most of the fit; the per-atom estimate A_a = y_a r_a^2
+    # weights every atom equally, and its median is insensitive to outliers.
+    # If the 1/r^2 model holds, all three agree. If they do not, the spread is
+    # the honest uncertainty on A and the model is the thing at fault.
     x = r ** -2.0
     amplitude = float(np.sum(dF_rad * x) / np.sum(x ** 2))
+    per_atom = dF_rad * r ** 2
+    amplitude_mean = float(np.mean(per_atom))
+    amplitude_median = float(np.median(per_atom))
 
     ss_res = float(np.sum((dF_rad - amplitude * x) ** 2))
     ss_tot = float(np.sum((dF_rad - np.mean(dF_rad)) ** 2))
@@ -987,6 +1032,13 @@ def _fit_radial_amplitude(dF_rad, r):
     return {
         "n_atoms": n,
         "amplitude_eVA": amplitude,
+        "amplitude_mean_eVA": amplitude_mean,
+        "amplitude_median_eVA": amplitude_median,
+        "amplitude_spread_percent": (
+            100.0 * (max(amplitude, amplitude_mean, amplitude_median)
+                     - min(amplitude, amplitude_mean, amplitude_median)) / abs(amplitude)
+            if amplitude != 0.0 else float("nan")
+        ),
         "r_squared": r_squared,
         "loglog_exponent": exponent,
         "n_sign_consistent": int(np.sum(same_sign)),
@@ -1162,6 +1214,9 @@ def fit_monopole_tail(
             "n_atoms_in_window": n_sel,
             "n_unmatched": n_unmatched_s,
             "amplitude_eVA": fit["amplitude_eVA"],
+            "amplitude_mean_eVA": fit["amplitude_mean_eVA"],
+            "amplitude_median_eVA": fit["amplitude_median_eVA"],
+            "amplitude_spread_percent": fit["amplitude_spread_percent"],
             "r_squared": fit["r_squared"],
             "loglog_exponent": fit["loglog_exponent"],
             "n_sign_consistent": fit["n_sign_consistent"],
@@ -1313,6 +1368,27 @@ def fit_monopole_tail(
                 "which is the signature of reference-image contamination. Move r_fit inward."
             )
 
+    # ---- layer-resolved diagnostic ----------------------------------------
+    # Pure reporting: it does not change the amplitudes used for the fill.
+    layers = layer_indices(lattice, positions)
+    defect_layer = int(layers[int(defect_index)])
+    per_species_layer = {}
+    for s in unique_species:
+        if per_species[s]["skipped"]:
+            continue
+        rows = []
+        for L in sorted(set(layers.tolist())):
+            sel_L = in_window & (species == s) & (layers == L)
+            n_L = int(np.sum(sel_L))
+            row = {"layer": L, "relative_to_defect": L - defect_layer, "n_atoms": n_L}
+            if n_L >= 3:
+                row.update(_fit_radial_amplitude(dF_rad[sel_L], r[sel_L]))
+            else:
+                row.update({"amplitude_eVA": float("nan"), "r_squared": float("nan"),
+                            "loglog_exponent": float("nan")})
+            rows.append(row)
+        per_species_layer[s] = rows
+
     fitted = [s for s in unique_species if not per_species[s]["skipped"]]
     sel_all = in_window & np.isin(species.astype(str), np.array([str(s) for s in fitted]))
     positive = sel_all & (np.abs(dF_rad) > 0)
@@ -1376,6 +1452,9 @@ def fit_monopole_tail(
         "drift_percent": drift_percent,
         "sub_window_drift_verdict": drift_verdict,
         "skipped_species": skipped_species,
+        "per_species_layer": per_species_layer,
+        "defect_layer": defect_layer,
+        "n_layers": int(len(set(layers.tolist()))),
         "per_species": per_species,
         "combined_loglog_exponent": exponent_all,
         "ratio_A_B_over_A_N": ratio_B_over_N,
@@ -1638,6 +1717,11 @@ def print_monopole_tail_summary(info):
                 f"    {str(s):<9}{d['n_atoms_in_window']:>7}{d['amplitude_eVA']:>15.6f}"
                 f"{d['r_squared']:>10.4f}{d['loglog_exponent']:>11.3f}"
             )
+            print(
+                f"    {'':<9}{'estimators':>7}  least squares {d['amplitude_eVA']:.4f} | "
+                f"mean {d['amplitude_mean_eVA']:.4f} | median {d['amplitude_median_eVA']:.4f}"
+                f"   spread {d['amplitude_spread_percent']:.1f}%"
+            )
     print("")
     print("  sub-window drift of A  (is one amplitude enough?)")
     print(f"    {'species':<9}{'window [A]':>14}{'N':>6}{'A [eV*A]':>15}{'R^2':>9}{'exponent':>11}")
@@ -1661,6 +1745,17 @@ def print_monopole_tail_summary(info):
                 line += f", {extra:+.1f}% extrapolated to {fit['extrapolation_radius_A']:.1f} A"
             print(line + ")")
     print(f"    verdict: {fit['sub_window_drift_verdict']}")
+    print("")
+    if fit.get("n_layers", 1) > 1:
+        print("")
+        print(f"  layer-resolved fit  ({fit['n_layers']} layers, defect in layer "
+              f"{fit['defect_layer']})")
+        print(f"    {'species':<9}{'layer':>8}{'N':>7}{'A [eV*A]':>15}{'R^2':>10}{'exponent':>11}")
+        for s, rows in fit.get("per_species_layer", {}).items():
+            for row in rows:
+                tag = f"{row['relative_to_defect']:+d}" if row["relative_to_defect"] else "defect"
+                print(f"    {str(s):<9}{tag:>8}{row['n_atoms']:>7}{row['amplitude_eVA']:>15.6f}"
+                      f"{row['r_squared']:>10.4f}{row['loglog_exponent']:>11.3f}")
     print("")
     print(f"  combined log-log exponent : {fit['combined_loglog_exponent']:.3f}  (expect ~ -2)")
     print(f"  A_B / A_N                 : {fit['ratio_A_B_over_A_N']:.3f}  (expect ~ -1)")

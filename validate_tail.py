@@ -38,6 +38,10 @@ import numpy as np
 
 from pl_embedding import (
     Photoluminescence,
+    _fit_radial_amplitude,
+    defect_displacements,
+    locate_minority_species_atom,
+    species_labels_from_counts,
     apply_analytic_tail_to_difference,
     apply_force_embedding_mapping,
     build_unit_to_target_force_mapping,
@@ -246,6 +250,11 @@ def main():
 
     lattice, species_names, counts, _ = read_poscar(args.target_poscar)
     n_atoms = int(np.sum(counts))
+    defect_index_used = (
+        args.defect_index
+        if args.defect_index is not None
+        else locate_minority_species_atom(species_names, counts)[0]
+    )
     species_check = check_phonon_species_order(
         band_yaml=args.band_yaml, target_poscar=args.target_poscar, masses=masses
     )
@@ -275,6 +284,7 @@ def main():
     }
 
     dF_all, Sk_all, integ_all, raw_all, stot_all = {}, {}, {}, {}, {}
+    mask_all, tail_info_all = {}, {}
     positions_ref = None
 
     for case in CASES:
@@ -284,7 +294,7 @@ def main():
         print(f" case: {case}   ({mode} embedding of {outcar_gs})")
         print("-" * 74)
 
-        dF, positions, target_to_unit, mapping_info, _, shift_info = build_difference_force(
+        dF, positions, target_to_unit, mapping_info, tail_info, shift_info = build_difference_force(
             outcar_es, outcar_gs, args.target_poscar, mode, args
         )
         positions_ref = positions
@@ -367,10 +377,66 @@ def main():
         integ, raw = window_integrals(S_E, E_grid, Sk, Ek)
 
         dF_all[case] = dF
+        mask_all[case] = target_to_unit < 0
+        tail_info_all[case] = tail_info
         Sk_all[case] = Sk
         integ_all[case] = integ
         raw_all[case] = raw
         stot_all[case] = float(np.sum(Sk))
+
+    # ---- fill-region audit --------------------------------------------------
+    # The reference case supplies the TRUE dF on exactly the atoms truncation
+    # leaves empty, so the analytic fill can be scored against it directly
+    # rather than inferred from the spectrum. This is the only place the
+    # amplitude can be checked against the thing it is meant to reproduce.
+    fill = mask_all["trunc"]
+    n_fill = int(np.sum(fill))
+    if n_fill and REFERENCE_CASE in dF_all:
+        R_vec, r_vec, _ = defect_displacements(lattice, positions_ref, defect_index_used)
+        R_hat = np.zeros_like(R_vec)
+        nz = r_vec > 0
+        R_hat[nz] = R_vec[nz] / r_vec[nz, None]
+        labels = species_labels_from_counts(species_names, counts)
+        truth = dF_all[REFERENCE_CASE]
+        truth_norm = float(np.linalg.norm(truth[fill]))
+
+        print("")
+        print(" Fill-region audit: the analytic tail against the reference's true forces")
+        print(f"  {n_fill} atoms that truncation leaves empty, r from "
+              f"{r_vec[fill].min():.2f} to {r_vec[fill].max():.2f} A")
+        print("")
+        print(f"  {'case':<16}{'sum|dF| there':>16}{'relative error vs reference':>30}")
+        print("  " + "-" * 62)
+        for c in CASES:
+            err = (
+                float(np.linalg.norm(dF_all[c][fill] - truth[fill])) / truth_norm
+                if truth_norm > 0 else float("nan")
+            )
+            print(f"  {c:<16}{float(np.sum(np.abs(dF_all[c][fill]))):>16.6f}{err:>30.4f}")
+        print("")
+        print("  Truncation scores 1.000 by construction: it puts zero there. Any fill that")
+        print("  scores above 1.000 is further from the truth than leaving the region empty.")
+
+        print("")
+        print("  Amplitude the reference's own field wants in the fill region, against the")
+        print("  amplitude fitted from the reference window and used for the fill:")
+        print(f"    {'species':<9}{'A fitted':>13}{'A from truth':>15}{'ratio':>9}"
+              f"{'median(truth)':>15}{'R^2 of truth':>14}")
+        fitted_amps = (tail_info_all.get("tail+SR") or {}).get("amplitudes_eVA", {})
+        truth_rad = np.einsum("ij,ij->i", truth, R_hat)
+        for s in dict.fromkeys(species_names):
+            sel = fill & (np.array([str(x) for x in labels]) == str(s))
+            if int(np.sum(sel)) < 3:
+                continue
+            t = _fit_radial_amplitude(truth_rad[sel], r_vec[sel])
+            a_fit = float(fitted_amps.get(str(s), float("nan")))
+            ratio = a_fit / t["amplitude_eVA"] if t["amplitude_eVA"] != 0 else float("nan")
+            print(f"    {str(s):<9}{a_fit:>13.4f}{t['amplitude_eVA']:>15.4f}{ratio:>9.2f}"
+                  f"{t['amplitude_median_eVA']:>15.4f}{t['r_squared']:>14.4f}")
+        print("")
+        print("  A ratio far from 1 means the window the amplitude was fitted in does not")
+        print("  describe the region it is being extrapolated into. A low R^2 in the last")
+        print("  column means no single amplitude describes that region either.")
 
     ref_integ = integ_all[REFERENCE_CASE]
     ref_raw = raw_all[REFERENCE_CASE]
