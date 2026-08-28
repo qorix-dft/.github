@@ -41,10 +41,12 @@ from pl_embedding import (
     apply_analytic_tail_to_difference,
     apply_force_embedding_mapping,
     build_unit_to_target_force_mapping,
+    defect_alignment_shift,
     enforce_force_sum_rule,
     force_structure_factor,
     read_poscar,
     smallest_nonzero_q,
+    verify_defect_correspondence,
 )
 
 
@@ -101,13 +103,27 @@ def build_difference_force(outcar_es, outcar_gs, target_poscar, mode, args):
         "sumrule"  as "raw", then sum_a dF_a = 0 re-imposed
         "tail"     as "raw", then the unmatched atoms filled with the fitted
                    analytic monopole tail, then the sum rule re-imposed
+
+    Reference cells that substituted a different site of the same host lattice
+    are translated onto the target first, so that the untruncated 15x9 case can
+    be run against a target built around the 10x8 defect position. A shift below
+    the matching tolerance is treated as no shift at all.
     """
+    shift, shift_info = None, None
+    if args.align_defects:
+        candidate, shift_info = defect_alignment_shift(
+            unit_outcar=outcar_gs, target_poscar=target_poscar
+        )
+        if shift_info["shift_norm_A"] > args.tolerance:
+            shift = candidate
+
     target_to_unit, target_positions, mapping_info = build_unit_to_target_force_mapping(
         unit_outcar=outcar_gs,
         target_poscar=target_poscar,
         tolerance=args.tolerance,
         pbc=EMBED_PBC,
         bijective=EMBED_BIJECTIVE,
+        unit_position_shift=shift,
     )
 
     F_es = apply_force_embedding_mapping(outcar_es, target_to_unit)
@@ -133,7 +149,7 @@ def build_difference_force(outcar_es, outcar_gs, target_poscar, mode, args):
     elif mode != "raw":
         raise ValueError(f"Unknown mode '{mode}'.")
 
-    return dF, target_positions, target_to_unit, mapping_info, tail_info
+    return dF, target_positions, target_to_unit, mapping_info, tail_info, shift_info
 
 
 def spectrum_from_dF(pl, dF, masses, modes, freqs, Ek, E_grid, sigma):
@@ -200,6 +216,18 @@ def main():
     parser.add_argument("--sigma", type=float, default=SIGMA_MEV)
     parser.add_argument("--n-q", type=int, default=N_Q_SMALLEST)
     parser.add_argument(
+        "--no-align-defects",
+        dest="align_defects",
+        action="store_false",
+        help="do not translate a reference onto the target's defect site before matching",
+    )
+    parser.add_argument(
+        "--allow-incomplete-reference",
+        action="store_true",
+        help="continue even if the reference case fails to match every target atom, which "
+             "means case 4 is not the untruncated answer",
+    )
+    parser.add_argument(
         "--include-out-of-plane-q",
         action="store_true",
         help="include reciprocal vectors along the vacuum direction in the C3 table",
@@ -250,10 +278,57 @@ def main():
         print(f" case: {case}   ({mode} embedding of {outcar_gs})")
         print("-" * 74)
 
-        dF, positions, target_to_unit, mapping_info, _ = build_difference_force(
+        dF, positions, target_to_unit, mapping_info, _, shift_info = build_difference_force(
             outcar_es, outcar_gs, args.target_poscar, mode, args
         )
         positions_ref = positions
+
+        if shift_info is not None:
+            applied = mapping_info["unit_position_shift_norm_A"]
+            if applied > 0:
+                v = mapping_info["unit_position_shift_A"]
+                print(
+                    f"  defect alignment: reference atom {shift_info['unit_defect_index']} "
+                    f"({shift_info['defect_species']}) translated onto target atom "
+                    f"{shift_info['target_defect_index']} by "
+                    f"({v[0]:+.4f}, {v[1]:+.4f}, {v[2]:+.4f}) A, |shift| {applied:.4f} A"
+                )
+            else:
+                print(
+                    f"  defect alignment: already aligned "
+                    f"(|shift| {shift_info['shift_norm_A']:.2e} A, below the "
+                    f"{args.tolerance:g} A tolerance), no translation applied"
+                )
+
+        correspondence = verify_defect_correspondence(
+            target_to_unit=target_to_unit, unit_outcar=outcar_gs, target_poscar=args.target_poscar
+        )
+        if not correspondence["ok"]:
+            raise ValueError(
+                f"Case '{case}': the target's defect atom "
+                f"{correspondence['target_defect_index']} "
+                f"({correspondence['defect_species']}) is "
+                + (
+                    "not matched to any reference atom"
+                    if correspondence["defect_unmatched"]
+                    else f"matched to reference atom {correspondence['mapped_unit_index']}, "
+                         f"not the reference's own defect atom "
+                         f"{correspondence['unit_defect_index']}"
+                )
+                + ".\n"
+                "  The reference's force field is centred on a different site from the target's, "
+                "so every embedded force belongs to the wrong defect position.\n"
+                "  Note that the unmatched-atom count does NOT catch this: two cells that "
+                "substituted different sites of one host lattice differ in only two atoms, so "
+                "the mapping can look ~99.9% complete while the embedded dF is wholly wrong.\n"
+                "  Fix by aligning the defects (this runs by default; --no-align-defects "
+                "disables it). If alignment is on and this still fires, the two cells are not "
+                "related by a lattice translation and no rigid shift can align them."
+            )
+        print(
+            f"  defect correspondence: target atom {correspondence['target_defect_index']} "
+            f"<- reference atom {correspondence['mapped_unit_index']}   [OK]"
+        )
 
         n_unmatched = int(np.sum(target_to_unit < 0))
         print(
@@ -262,10 +337,24 @@ def main():
             f"max match distance {mapping_info['max_match_distance_A']:.4f} A"
         )
         if case == REFERENCE_CASE and n_unmatched != 0:
-            print(
-                f"  *** WARNING: the reference case left {n_unmatched} target atoms unmatched. "
-                "It is meant to be the untruncated answer; check the tolerance and the cells."
+            message = (
+                f"The reference case left {n_unmatched} of {mapping_info['n_target']} target "
+                "atoms unmatched, so it is NOT the untruncated answer and every ratio in this "
+                "run would be measured against a truncated baseline.\n"
+                "  Likely causes, in order:\n"
+                "   - the reference and the target place the defect on different sites and the "
+                "translation could not align them (is the shift a host lattice vector?);\n"
+                "   - the two cells are not the same structure (different relaxation, cell "
+                "shape or atom count), which no rigid translation can fix;\n"
+                "   - the matching tolerance is too tight for the relaxation present.\n"
+                f"  max match distance was {mapping_info['max_match_distance_A']:.4f} A against "
+                f"a tolerance of {args.tolerance:g} A.\n"
+                "  Re-run with --allow-incomplete-reference to proceed anyway and see the numbers."
             )
+            if args.allow_incomplete_reference:
+                print(f"  *** WARNING: {message}")
+            else:
+                raise ValueError(message)
         print(f"  |sum dF| = {np.linalg.norm(dF.sum(axis=0)):.3e} eV/A")
 
         Sk, S_E = spectrum_from_dF(pl, dF, masses, modes, freqs, Ek, E_grid, args.sigma)

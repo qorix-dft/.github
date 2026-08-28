@@ -163,6 +163,7 @@ def build_unit_to_target_force_mapping(
     pbc=True,
     bijective=True,
     unit_poscar_for_species_check=None,
+    unit_position_shift=None,
 ):
     """
     Build one atom-index mapping from a small/unit OUTCAR into a large target POSCAR.
@@ -172,6 +173,18 @@ def build_unit_to_target_force_mapping(
                         target_to_unit[i] is the matching unit atom index, or -1 if unmatched.
         target_positions: (N_target,3) cartesian positions from target POSCAR, in target order.
         mapping_info: dict with matching statistics.
+
+    unit_position_shift:
+        Optional constant vector (3,) in A added to every unit position before
+        matching. Use it when the reference and the target place the defect on
+        different sites of the same host lattice: two supercells of one material
+        differing only in which atom was substituted have the same host lattice
+        but different species blocks, so they will not match atom for atom until
+        one is translated onto the other. A rigid translation does not rotate
+        anything, so the forces themselves transfer unchanged; anything needing
+        a rotation or a different cell shape will simply fail to match, and the
+        returned statistics will say so. Use defect_alignment_shift to derive
+        the vector. Default None leaves matching exactly as before.
 
     Important:
       - The returned target_to_unit array is in the target POSCAR ordering.
@@ -192,6 +205,12 @@ def build_unit_to_target_force_mapping(
 
     unit_counts = extract_ions_per_type(unit_outcar)
     unit_pos, _ = read_last_total_force_block(unit_outcar)
+
+    if unit_position_shift is not None:
+        shift_vector = np.asarray(unit_position_shift, dtype=float).reshape(3)
+        unit_pos = unit_pos + shift_vector[None, :]
+    else:
+        shift_vector = np.zeros(3)
 
     if sum(unit_counts) != unit_pos.shape[0]:
         raise ValueError(
@@ -268,9 +287,147 @@ def build_unit_to_target_force_mapping(
         "max_match_distance_A": max_distance,
         "n_target": super_pos.shape[0],
         "n_unit": unit_pos.shape[0],
+        "unit_position_shift_A": shift_vector,
+        "unit_position_shift_norm_A": float(np.linalg.norm(shift_vector)),
     }
 
     return target_to_unit, super_pos, info
+
+
+def defect_alignment_shift(
+    unit_outcar,
+    target_poscar,
+    unit_species_order=None,
+    unit_defect_index=None,
+    target_defect_index=None,
+):
+    """
+    Rigid translation that puts the reference cell's defect on the target's defect.
+
+    A substitutional defect does not change the host lattice, only which site
+    carries the impurity. Two supercells of the same material that substituted
+    different sites therefore have identical atomic positions but different
+    species blocks: the target's carbon site is a boron in the reference and
+    vice versa, so a direct atom-for-atom match fails on exactly those sites and
+    on everything the differing defect environments displace.
+
+    Translating the whole reference by the vector between the two defect
+    positions fixes that, because the host lattice maps onto itself under a
+    lattice translation and the substituted sublattice maps onto itself. The
+    translation is rigid, so forces are carried across unchanged -- no rotation
+    is applied and none is inferred. Whether the two cells really are related
+    this way is not assumed: it is tested by the mapping that follows, which
+    reports how many target atoms were matched and how far.
+
+    Returns:
+        shift (3,) in A, info dict with the two defect indices and species.
+    """
+    lattice, target_species, target_counts, target_pos = read_poscar(target_poscar)
+    unit_counts = extract_ions_per_type(unit_outcar)
+    unit_pos, _ = read_last_total_force_block(unit_outcar)
+
+    if sum(unit_counts) != unit_pos.shape[0]:
+        raise ValueError(
+            f"Unit OUTCAR ions-per-type sum ({sum(unit_counts)}) != "
+            f"TOTAL-FORCE atom count ({unit_pos.shape[0]})."
+        )
+    if len(unit_counts) != len(target_counts):
+        raise ValueError(
+            "Different number of species types between unit OUTCAR and target POSCAR.\n"
+            f"Unit (ions per type): {unit_counts}\n"
+            f"Target (POSCAR):      {target_counts}"
+        )
+
+    unit_species = list(unit_species_order) if unit_species_order is not None else list(target_species)
+
+    if target_defect_index is None:
+        target_defect_index, target_label = locate_minority_species_atom(
+            target_species, target_counts
+        )
+    else:
+        target_defect_index = int(target_defect_index)
+        target_label = str(species_labels_from_counts(target_species, target_counts)[target_defect_index])
+
+    if unit_defect_index is None:
+        unit_defect_index, unit_label = locate_minority_species_atom(unit_species, unit_counts)
+    else:
+        unit_defect_index = int(unit_defect_index)
+        unit_label = str(species_labels_from_counts(unit_species, unit_counts)[unit_defect_index])
+
+    if str(unit_label) != str(target_label):
+        raise ValueError(
+            f"Defect species differ: reference has '{unit_label}', target has '{target_label}'. "
+            "A rigid translation can only align the same defect in two cells."
+        )
+
+    raw = target_pos[target_defect_index] - unit_pos[unit_defect_index]
+    shift = minimum_image_displacement(lattice, raw)
+
+    info = {
+        "unit_defect_index": unit_defect_index,
+        "target_defect_index": target_defect_index,
+        "defect_species": str(target_label),
+        "shift_A": shift,
+        "shift_norm_A": float(np.linalg.norm(shift)),
+        "shift_before_wrapping_A": raw,
+    }
+    return shift, info
+
+
+def verify_defect_correspondence(
+    target_to_unit,
+    unit_outcar,
+    target_poscar,
+    unit_species_order=None,
+    unit_defect_index=None,
+    target_defect_index=None,
+):
+    """
+    Check that the target's defect atom is matched to the reference's defect atom.
+
+    This is the one test that catches a reference embedded around the wrong site,
+    and it is needed because the obvious test does not. Two 15x9 cells that
+    substituted different sites of the same host lattice differ in only two
+    atoms: each cell's defect site is an ordinary host atom in the other. Matching
+    them without a translation therefore leaves just 2 of 1620 target atoms
+    unmatched, every one of the other 1618 matching at a distance of ~0 A, while
+    the embedded difference force field is centred on the wrong site and is
+    ~140% wrong. Unmatched counts and match distances are both nearly blind to
+    it; the defect correspondence is not.
+
+    Returns:
+        dict with 'ok' and the three indices involved.
+    """
+    target_to_unit = np.asarray(target_to_unit, dtype=int)
+    _, target_species, target_counts, _ = read_poscar(target_poscar)
+    unit_counts = extract_ions_per_type(unit_outcar)
+    unit_species = (
+        list(unit_species_order) if unit_species_order is not None else list(target_species)
+    )
+
+    if target_defect_index is None:
+        target_defect_index, target_label = locate_minority_species_atom(
+            target_species, target_counts
+        )
+    else:
+        target_defect_index = int(target_defect_index)
+        target_label = str(
+            species_labels_from_counts(target_species, target_counts)[target_defect_index]
+        )
+    if unit_defect_index is None:
+        unit_defect_index, _ = locate_minority_species_atom(unit_species, unit_counts)
+    else:
+        unit_defect_index = int(unit_defect_index)
+
+    mapped = int(target_to_unit[target_defect_index])
+    return {
+        "ok": mapped == int(unit_defect_index),
+        "target_defect_index": target_defect_index,
+        "unit_defect_index": int(unit_defect_index),
+        "mapped_unit_index": mapped,
+        "defect_species": str(target_label),
+        "defect_unmatched": mapped < 0,
+    }
 
 
 def apply_force_embedding_mapping(unit_outcar, target_to_unit):
