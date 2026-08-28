@@ -41,9 +41,11 @@ from pl_embedding import (
     apply_analytic_tail_to_difference,
     apply_force_embedding_mapping,
     build_unit_to_target_force_mapping,
+    check_phonon_species_order,
     defect_alignment_shift,
     enforce_force_sum_rule,
     force_structure_factor,
+    phonon_species_order_message,
     read_poscar,
     smallest_nonzero_q,
     verify_defect_correspondence,
@@ -244,10 +246,12 @@ def main():
 
     lattice, species_names, counts, _ = read_poscar(args.target_poscar)
     n_atoms = int(np.sum(counts))
-    if masses.shape[0] != n_atoms:
+    species_check = check_phonon_species_order(
+        band_yaml=args.band_yaml, target_poscar=args.target_poscar, masses=masses
+    )
+    if not species_check["ok"]:
         raise ValueError(
-            f"band.yaml has {masses.shape[0]} atoms but the target POSCAR has {n_atoms}. "
-            "The modes and the target must describe the same cell, in the same order."
+            phonon_species_order_message(args.band_yaml, args.target_poscar, species_check)
         )
 
     print("=" * 74)
@@ -255,6 +259,8 @@ def main():
     print("=" * 74)
     print(f"  target            : {args.target_poscar}  ({n_atoms} atoms, {species_names} {counts})")
     print(f"  modes             : {args.band_yaml}  ({modes.shape[0]} modes)")
+    print(f"  phonon/target     : consistent  [{', '.join(species_check['tests_run'])}]"
+          + ("" if species_check["symbols_available"] else "; no symbols in band.yaml"))
     print(f"  Delta q           : {args.delta_q:+d}")
     print(f"  fit window        : [{args.fit_lo:g}, {args.fit_hi:g}) A")
     print(f"  broadening sigma  : {args.sigma:g} meV")

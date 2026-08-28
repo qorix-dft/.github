@@ -131,6 +131,162 @@ def read_last_total_force_block(outcar_path):
     return np.array(positions, dtype=float), np.array(forces, dtype=float)
 
 
+def read_phonon_points(path):
+    """
+    Per-atom species symbols and masses from the 'points' section of a band.yaml.
+
+    ReadPhononsPhonopy already reads the masses, but only the masses. Phonopy
+    also writes a symbol beside each one, which is what makes it possible to
+    check that the phonons and the target describe the same cell in the same
+    order rather than merely the same number of atoms.
+
+    Returns:
+        symbols: (N,) object array, or None if the file carries no symbol entries
+        masses:  (N,) array in amu
+    """
+    symbols, masses = [], []
+    with open(path, "r") as f:
+        for line in f:
+            if "symbol:" in line:
+                token = line.split("symbol:", 1)[1].split("#")[0].strip()
+                if token:
+                    symbols.append(token)
+            if "mass:" in line:
+                token = line.split("mass:", 1)[1].split("#")[0].strip()
+                if token:
+                    masses.append(float(token))
+
+    masses = np.array(masses, dtype=float)
+    if not symbols or len(symbols) != masses.shape[0]:
+        return None, masses
+    return np.array(symbols, dtype=object), masses
+
+
+def check_phonon_species_order(band_yaml, target_poscar, symbols=None, masses=None):
+    """
+    Verify that band.yaml and the target POSCAR describe one cell in one order.
+
+    ConfigCoordinatesF contracts modes[i, a, :] with dF[a, :] / sqrt(m_a), so
+    index a must be the same physical atom in the phonons, the target POSCAR and
+    the embedded force array. Only the atom COUNT is otherwise checked, and two
+    supercells of the same material with the defect on different sites have the
+    same count -- so a wrong band.yaml produces a plausible spectrum rather than
+    an error.
+
+    Two independent tests are applied:
+      - the per-atom symbol sequence against the POSCAR's species sequence, when
+        the file carries symbols;
+      - the masses grouped by POSCAR species, which must be constant within each
+        species and distinct between species. This needs no external mass table
+        and catches a relocated defect on its own: a carbon sitting where the
+        POSCAR says boron leaves a 12.011 among the 10.811s.
+
+    Returns:
+        dict with 'ok', the tests that ran, and the first few mismatches.
+    """
+    _, species_names, counts, _ = read_poscar(target_poscar)
+    labels = species_labels_from_counts(species_names, counts)
+    n_atoms = labels.shape[0]
+
+    if symbols is None or masses is None:
+        file_symbols, file_masses = read_phonon_points(band_yaml)
+        symbols = file_symbols if symbols is None else symbols
+        masses = file_masses if masses is None else masses
+
+    problems = []
+    tests = []
+
+    if masses.shape[0] != n_atoms:
+        problems.append(
+            f"band.yaml has {masses.shape[0]} atoms, the target POSCAR has {n_atoms}"
+        )
+        return {
+            "ok": False, "n_atoms_poscar": n_atoms, "n_atoms_band": int(masses.shape[0]),
+            "tests_run": ["atom count"], "problems": problems, "symbol_mismatches": [],
+        }
+    tests.append("atom count")
+
+    symbol_mismatches = []
+    if symbols is not None and symbols.shape[0] == n_atoms:
+        tests.append("symbol sequence")
+        differ = np.where(np.array([str(x) for x in symbols]) != np.array([str(x) for x in labels]))[0]
+        if differ.size:
+            symbol_mismatches = [
+                (int(i), str(symbols[i]), str(labels[i])) for i in differ[:5]
+            ]
+            problems.append(
+                f"{differ.size} of {n_atoms} atoms have a different species in band.yaml than in "
+                "the target POSCAR; first few (index, band.yaml, POSCAR): "
+                + ", ".join(f"({i}, {b}, {p})" for i, b, p in symbol_mismatches)
+            )
+
+    tests.append("mass grouping by species")
+    group_masses = {}
+    mass_groups_clean = True
+    for s in dict.fromkeys(species_names):
+        sel = np.array([str(x) for x in labels]) == str(s)
+        if not np.any(sel):
+            continue
+        block = masses[sel]
+        reference_mass = float(block[0])
+        stray = np.where(np.abs(block - reference_mass) > 1e-6)[0]
+        if stray.size:
+            mass_groups_clean = False
+            where = np.where(sel)[0][stray[:5]]
+            problems.append(
+                f"species '{s}' does not carry one mass in band.yaml: {stray.size} of "
+                f"{block.shape[0]} atoms differ from {reference_mass:.4f} amu; first few at "
+                "indices " + ", ".join(f"{int(i)} ({masses[i]:.4f})" for i in where)
+            )
+        group_masses[str(s)] = reference_mass
+
+    # Only meaningful when every group carried one mass. If some did not, a
+    # collapsed distinction is a symptom of that scrambling, not a separate finding.
+    if mass_groups_clean:
+        distinct = list(group_masses.items())
+        for i in range(len(distinct)):
+            for j in range(i + 1, len(distinct)):
+                if abs(distinct[i][1] - distinct[j][1]) <= 1e-6:
+                    problems.append(
+                        f"species '{distinct[i][0]}' and '{distinct[j][0]}' share the mass "
+                        f"{distinct[i][1]:.4f} amu, so the mass test cannot tell them apart"
+                    )
+
+    return {
+        "ok": not problems,
+        "n_atoms_poscar": n_atoms,
+        "n_atoms_band": int(masses.shape[0]),
+        "tests_run": tests,
+        "problems": problems,
+        "symbol_mismatches": symbol_mismatches,
+        "species_masses_amu": group_masses,
+        "symbols_available": symbols is not None,
+    }
+
+
+def phonon_species_order_message(band_yaml, target_poscar, result):
+    """The explanation printed or raised when check_phonon_species_order fails."""
+    lines = [
+        f"band.yaml and the target POSCAR do not describe the same cell in the same order.",
+        f"  phonons : {band_yaml}",
+        f"  target  : {target_poscar}",
+    ]
+    for p in result["problems"]:
+        lines.append(f"  - {p}")
+    lines.append(
+        "  The projection contracts mode component a with force row a, so a mismatch here "
+        "silently mixes atoms rather than failing. Two supercells of one material with the "
+        "defect on different sites have the same atom count and pass every other check, so "
+        "use the band.yaml built for THIS target."
+    )
+    if not result["symbols_available"]:
+        lines.append(
+            "  (This band.yaml carries no 'symbol:' entries, so only the mass grouping "
+            "could be tested.)"
+        )
+    return "\n".join(lines)
+
+
 # =============================================================================
 # Minimum-image distance under supercell PBC
 # =============================================================================
@@ -1837,6 +1993,8 @@ def CalculateSpectrum(
     tail_fit_window=(6.0, 16.0),
     tail_delta_q=None,               # +1 for C_B, -1 for C_N; 0 is rejected (no monopole)
     enforce_sum_rule=False,          # re-impose sum_a dF_a = 0 even without a tail (control)
+    # "warn" prints and continues, so results are unchanged; "raise" stops; "off" skips.
+    phonon_species_check="warn",
 ):
     pl = Photoluminescence()
 
@@ -1894,6 +2052,16 @@ def CalculateSpectrum(
                     F_gs,
                     title="SYNTHETIC OUTCAR GS (force-embedded, shared index map)",
                 )
+
+            if phonon_species_check != "off":
+                species_check = check_phonon_species_order(path_phonon_band, reference_poscar)
+                if not species_check["ok"]:
+                    message = phonon_species_order_message(
+                        path_phonon_band, reference_poscar, species_check
+                    )
+                    if phonon_species_check == "raise":
+                        raise ValueError(message)
+                    print(f"[PHONON/TARGET MISMATCH WARNING]\n{message}")
 
             print(f"[Embedding shared map from {embed_mapping_reference.upper()}]", mapping_info)
 
