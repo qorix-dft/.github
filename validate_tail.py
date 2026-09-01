@@ -156,6 +156,8 @@ def build_difference_force(outcar_es, outcar_gs, target_poscar, mode, args):
             layer_resolved=args.layer_resolved,
             fill_zero_mean=args.fill_zero_mean,
             fill_radius_max=args.fill_radius_max,
+            fill_exponent_mode=args.fill_exponent,
+            fill_exponent_min_r2=args.fill_exponent_min_r2,
             verbose=True,
         )
     elif mode != "raw":
@@ -233,6 +235,19 @@ def main():
         help="fit and fill one amplitude per species AND layer, instead of one per species",
     )
     parser.add_argument(
+        "--fill-exponent",
+        choices=("fixed", "fitted", "auto"),
+        default="fixed",
+        help="radial law for the fill: 'fixed' is A/r^2 as before, 'fitted' uses each group's "
+             "measured exponent, 'auto' uses it only where the fit was good enough",
+    )
+    parser.add_argument(
+        "--fill-exponent-min-r2",
+        type=float,
+        default=0.8,
+        help="R^2 a group's fit must reach before 'auto' trusts its measured exponent",
+    )
+    parser.add_argument(
         "--fill-radius-max",
         type=float,
         default=None,
@@ -266,7 +281,7 @@ def main():
     args = parser.parse_args()
 
     import pl_embedding
-    require_api_level(7, caller="validate_tail.py")
+    require_api_level(9, caller="validate_tail.py")
 
     pl = Photoluminescence()
 
@@ -433,44 +448,93 @@ def main():
         truth = dF_all[REFERENCE_CASE]
         truth_norm = float(np.linalg.norm(truth[fill]))
 
+        # With a fill radius cap the tail only treats part of the region truncation
+        # empties, so scoring it over the whole region understates it. Both are
+        # reported: the region it actually treated, and the whole region, which is
+        # what the spectrum sees.
+        if args.fill_radius_max is not None:
+            treated = fill & (r_vec <= float(args.fill_radius_max))
+        else:
+            treated = fill.copy()
+        untreated = fill & ~treated
+
         print("")
         print(" Fill-region audit: the analytic tail against the reference's true forces")
         print(f"  {n_fill} atoms that truncation leaves empty, r from "
               f"{r_vec[fill].min():.2f} to {r_vec[fill].max():.2f} A")
+        if args.fill_radius_max is not None:
+            print(f"  of those the tail treated {int(np.sum(treated))} "
+                  f"(r <= {args.fill_radius_max:g} A) and left "
+                  f"{int(np.sum(untreated))} truncated")
+
+        def _err(vec, mask):
+            norm = float(np.linalg.norm(truth[mask]))
+            if norm == 0:
+                return float("nan")
+            return float(np.linalg.norm(vec[mask] - truth[mask])) / norm
+
         print("")
         print(f"  {'case':<16}{'sum|dF| there':>16}{'relative error vs reference':>30}")
         print("  " + "-" * 62)
         for c in CASES:
-            err = (
-                float(np.linalg.norm(dF_all[c][fill] - truth[fill])) / truth_norm
-                if truth_norm > 0 else float("nan")
-            )
-            print(f"  {c:<16}{float(np.sum(np.abs(dF_all[c][fill]))):>16.6f}{err:>30.4f}")
+            print(f"  {c:<16}{float(np.sum(np.abs(dF_all[c][fill]))):>16.6f}"
+                  f"{_err(dF_all[c], fill):>30.4f}")
+        if int(np.sum(untreated)):
+            print("")
+            print(f"  {'region':<26}{'n':>6}{'sum|dF| truth':>16}{'tail error there':>20}")
+            print("  " + "-" * 68)
+            print(f"  {'treated by the tail':<26}{int(np.sum(treated)):>6}"
+                  f"{float(np.sum(np.abs(truth[treated]))):>16.6f}"
+                  f"{_err(dF_all['tail+SR'], treated):>20.4f}")
+            print(f"  {'left truncated':<26}{int(np.sum(untreated)):>6}"
+                  f"{float(np.sum(np.abs(truth[untreated]))):>16.6f}"
+                  f"{_err(dF_all['tail+SR'], untreated):>20.4f}")
+            print("")
+            print("  The left-truncated row scores 1.0000 because nothing was put there. Compare")
+            print("  the treated row across cap settings: that is the region the tail actually")
+            print("  modelled, and it is the honest measure of how well the fill itself works.")
         print("")
         print("  Truncation scores 1.000 by construction: it puts zero there. Any fill that")
         print("  scores above 1.000 is further from the truth than leaving the region empty.")
 
         print("")
-        print("  Amplitude the reference's own field wants in the fill region, against the")
-        print("  amplitude fitted from the reference window and used for the fill:")
-        print(f"    {'species':<9}{'A fitted':>13}{'A from truth':>15}{'ratio':>9}"
-              f"{'median(truth)':>15}{'R^2 of truth':>14}")
-        fitted_amps = (tail_info_all.get("tail+SR") or {}).get("amplitudes_eVA", {})
+        print("  What the fill put down over the atoms it actually filled, against the")
+        print("  reference's own field there. The truth is refitted at each group's own fill")
+        print("  exponent, since an r^-2 amplitude and an r^-2.6 amplitude are different")
+        print("  quantities and cannot be divided by one another.")
+        print(f"    {'species':<9}{'exponent':>10}{'A fitted':>13}{'A truth':>13}{'ratio':>8}"
+              f"{'median fill/true':>18}{'R^2 of truth':>14}")
+        tail_info = tail_info_all.get("tail+SR") or {}
+        fitted_amps = tail_info.get("amplitudes_eVA", {})
+        fill_powers = (tail_info.get("apply_stats") or {}).get("fill_exponents") or {}
         truth_rad = np.einsum("ij,ij->i", truth, R_hat)
         key_strings = np.array([str(x) for x in audit_keys])
         for s in dict.fromkeys(key_strings.tolist()):
-            sel = fill & (key_strings == s)
+            sel = treated & (key_strings == s)
             if int(np.sum(sel)) < 3:
                 continue
-            t = _fit_radial_amplitude(truth_rad[sel], r_vec[sel])
+            power = float(fill_powers.get(str(s), -2.0))
             a_fit = float(fitted_amps.get(str(s), float("nan")))
+            t = _fit_radial_amplitude(truth_rad[sel], r_vec[sel], fixed_exponent=power)
             ratio = a_fit / t["amplitude_eVA"] if t["amplitude_eVA"] != 0 else float("nan")
-            print(f"    {str(s):<9}{a_fit:>13.4f}{t['amplitude_eVA']:>15.4f}{ratio:>9.2f}"
-                  f"{t['amplitude_median_eVA']:>15.4f}{t['r_squared']:>14.4f}")
+
+            # Exponent free, and the number that actually says whether the fill is
+            # the right size: what it put down divided by what is there, atom by atom.
+            predicted = a_fit * r_vec[sel] ** power
+            actual = truth_rad[sel]
+            usable = np.abs(actual) > 0
+            median_ratio = (
+                float(np.median(predicted[usable] / actual[usable]))
+                if int(np.sum(usable)) else float("nan")
+            )
+            print(f"    {str(s):<9}{power:>10.3f}{a_fit:>13.4f}{t['amplitude_eVA']:>13.4f}"
+                  f"{ratio:>8.2f}{median_ratio:>18.2f}{t['r_squared']:>14.4f}")
         print("")
-        print("  A ratio far from 1 means the window the amplitude was fitted in does not")
-        print("  describe the region it is being extrapolated into. A low R^2 in the last")
-        print("  column means no single amplitude describes that region either.")
+        print("")
+        print("  Either ratio far from 1 means the window the fill was fitted in does not")
+        print("  describe the region it is extrapolated into: above 1 the fill overshoots,")
+        print("  below 1 it undershoots. A low R^2 in the last column means no single")
+        print("  amplitude describes that region at any exponent.")
 
     ref_integ = integ_all[REFERENCE_CASE]
     ref_raw = raw_all[REFERENCE_CASE]
@@ -532,10 +596,17 @@ def main():
         row += f"{d:>+14.4f}"
     print(row)
     print("  " + "-" * (16 + 14 * (len(CASES) - 1)))
+    i_opt_w = WINDOWS_MEV.index((150.0, 220.0))
     row = f"  {'sum':<16}"
     for c in CASES[:-1]:
         row += f"{totals[c]:>+14.4f}"
     print(row)
+    row = f"  {'sum below 150 meV':<16}"
+    for c in CASES[:-1]:
+        row += f"{totals[c] - (raw_all[c][i_opt_w] - ref_raw[i_opt_w]):>+14.4f}"
+    print(row)
+    print("  the optical row is present in every case including truncation, so it is not the")
+    print("  tail's; a small total can be two large errors either side of 150 meV cancelling")
     row = f"  {'S_tot - reference':<16}"
     for c in CASES[:-1]:
         row += f"{stot_all[c] - stot_all[REFERENCE_CASE]:>+14.4f}"

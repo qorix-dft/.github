@@ -27,7 +27,7 @@ import matplotlib.pyplot as plt
 # Bump whenever the public API gains or changes a parameter. The companion
 # scripts check it, so copying one file to a cluster without the other fails
 # with a message naming both paths instead of a TypeError deep in a call stack.
-API_LEVEL = 7
+API_LEVEL = 9
 
 
 def require_api_level(minimum, caller="this script"):
@@ -1032,9 +1032,14 @@ def enforce_force_sum_rule(dF):
     return dF_corrected, stats
 
 
-def _fit_radial_amplitude(dF_rad, r):
+def _fit_radial_amplitude(dF_rad, r, fixed_exponent=None):
     """
     One zero-intercept least squares fit of dF_rad against r^-2.
+
+    fixed_exponent refits at a given power instead, dF_rad = A r^p. The
+    amplitude of an r^-2 fit and the amplitude of an r^-2.6 fit are different
+    quantities with different units, so anything comparing two amplitudes must
+    put both at the same exponent first.
 
     A = sum(dF_rad * r^-2) / sum(r^-4), plus the R^2 of that fit and an
     independent log-log slope, which is the honest test of the assumed
@@ -1046,7 +1051,8 @@ def _fit_radial_amplitude(dF_rad, r):
     n = int(r.size)
     if n == 0:
         return {
-            "n_atoms": 0, "amplitude_eVA": 0.0, "amplitude_mean_eVA": 0.0,
+            "n_atoms": 0, "amplitude_eVA": 0.0, "amplitude_at_exponent_eVA": float("nan"),
+            "amplitude_mean_eVA": 0.0,
             "amplitude_median_eVA": 0.0, "amplitude_spread_percent": float("nan"),
             "r_squared": float("nan"),
             "loglog_exponent": float("nan"), "loglog_correlation": float("nan"),
@@ -1059,9 +1065,10 @@ def _fit_radial_amplitude(dF_rad, r):
     # weights every atom equally, and its median is insensitive to outliers.
     # If the 1/r^2 model holds, all three agree. If they do not, the spread is
     # the honest uncertainty on A and the model is the thing at fault.
-    x = r ** -2.0
+    power = -2.0 if fixed_exponent is None else float(fixed_exponent)
+    x = r ** power
     amplitude = float(np.sum(dF_rad * x) / np.sum(x ** 2))
-    per_atom = dF_rad * r ** 2
+    per_atom = dF_rad * r ** (-power)
     amplitude_mean = float(np.mean(per_atom))
     amplitude_median = float(np.median(per_atom))
 
@@ -1090,9 +1097,19 @@ def _fit_radial_amplitude(dF_rad, r):
                 slope, _ = np.polyfit(log_r, log_y, 1)
                 exponent = float(slope)
 
+    # The amplitude that goes with the MEASURED exponent, dF_rad = C r^n, rather
+    # than the one that goes with an assumed r^-2. Extrapolating an r^-2 fit into
+    # a region the fit never saw carries the whole discrepancy between the two,
+    # which grows as (r_fill / r_fit)^(2+n).
+    amplitude_at_exponent = float("nan")
+    if np.isfinite(exponent):
+        xn = r ** exponent
+        amplitude_at_exponent = float(np.sum(dF_rad * xn) / np.sum(xn ** 2))
+
     return {
         "n_atoms": n,
         "amplitude_eVA": amplitude,
+        "amplitude_at_exponent_eVA": amplitude_at_exponent,
         "amplitude_mean_eVA": amplitude_mean,
         "amplitude_median_eVA": amplitude_median,
         "amplitude_spread_percent": (
@@ -1269,6 +1286,7 @@ def fit_monopole_tail(
                 "n_atoms_in_window": n_sel,
                 "n_unmatched": n_unmatched_s,
                 "amplitude_eVA": 0.0,
+                "amplitude_at_exponent_eVA": float("nan"),
                 "r_squared": float("nan"),
                 "loglog_exponent": float("nan"),
                 "skipped": True,
@@ -1282,6 +1300,7 @@ def fit_monopole_tail(
             "n_atoms_in_window": n_sel,
             "n_unmatched": n_unmatched_s,
             "amplitude_eVA": fit["amplitude_eVA"],
+            "amplitude_at_exponent_eVA": fit["amplitude_at_exponent_eVA"],
             "amplitude_mean_eVA": fit["amplitude_mean_eVA"],
             "amplitude_median_eVA": fit["amplitude_median_eVA"],
             "amplitude_spread_percent": fit["amplitude_spread_percent"],
@@ -1553,6 +1572,7 @@ def apply_monopole_tail(
     species,
     lattice,
     amplitudes,
+    exponents=None,
     enforce_sum_rule=True,
     layer_resolved=False,
     fill_zero_mean=False,
@@ -1632,8 +1652,14 @@ def apply_monopole_tail(
     if n_filled:
         idx = np.where(unmatched)[0]
         A = np.array([amplitudes[str(keys[i])] for i in idx], dtype=float)
+        if exponents is None:
+            power = np.full(idx.shape[0], -2.0)
+        else:
+            power = np.array(
+                [float(exponents.get(str(keys[i]), -2.0)) for i in idx], dtype=float
+            )
         R_hat = R[idx] / r[idx, None]
-        dF_corrected[idx] = (A / r[idx] ** 2)[:, None] * R_hat
+        dF_corrected[idx] = (A * r[idx] ** power)[:, None] * R_hat
         fill_net_before = dF_corrected[idx].sum(axis=0)
 
         if fill_zero_mean:
@@ -1678,6 +1704,9 @@ def apply_monopole_tail(
         "layer_resolved": bool(layer_resolved),
         "fill_zero_mean": bool(fill_zero_mean),
         "fill_radius_max_A": fill_radius_max,
+        "fill_exponents": (
+            {str(k): float(v) for k, v in exponents.items()} if exponents else None
+        ),
         "n_left_truncated_beyond_fill_limit": n_beyond_fill_limit,
         "abs_fill_net_force_before_eVA": float(np.linalg.norm(fill_net_before)),
         "abs_fill_net_force_after_eVA": (
@@ -1704,6 +1733,8 @@ def apply_analytic_tail_to_difference(
     layer_resolved=False,
     fill_zero_mean=False,
     fill_radius_max=None,
+    fill_exponent_mode="fixed",
+    fill_exponent_min_r2=0.8,
     exact_minimum_image=True,
     verbose=True,
 ):
@@ -1775,6 +1806,42 @@ def apply_analytic_tail_to_difference(
         verbose=verbose,
     )
 
+    # Which radial law the fill uses. "fixed" is dF = A / r^2 throughout, the
+    # original behaviour. "fitted" uses each group's measured exponent. "auto"
+    # uses the measured exponent only where the r^-2 fit was good enough for it
+    # to mean something, and falls back to -2 elsewhere: a badly determined
+    # exponent extrapolates worse than the assumed one, so this is not a case
+    # where more freedom is automatically better.
+    fill_exponents = None
+    if fill_exponent_mode not in ("fixed", "fitted", "auto"):
+        raise ValueError(
+            f"fill_exponent_mode must be 'fixed', 'fitted' or 'auto', not {fill_exponent_mode!r}."
+        )
+    if fill_exponent_mode != "fixed":
+        fill_exponents = {}
+        chosen = {}
+        for key, d in fit_info["per_species"].items():
+            if d["skipped"]:
+                continue
+            exponent = d.get("loglog_exponent", float("nan"))
+            amplitude = d.get("amplitude_at_exponent_eVA", float("nan"))
+            good = (
+                np.isfinite(exponent)
+                and np.isfinite(amplitude)
+                and (
+                    fill_exponent_mode == "fitted"
+                    or d.get("r_squared", float("nan")) >= float(fill_exponent_min_r2)
+                )
+            )
+            if good:
+                fill_exponents[str(key)] = exponent
+                amplitudes[key] = amplitude
+                chosen[str(key)] = (exponent, amplitude)
+            else:
+                fill_exponents[str(key)] = -2.0
+        fit_info["fill_exponent_mode"] = fill_exponent_mode
+        fit_info["fill_exponent_groups"] = chosen
+
     dF_corrected, apply_stats = apply_monopole_tail(
         dF=dF,
         positions=target_positions,
@@ -1783,6 +1850,7 @@ def apply_analytic_tail_to_difference(
         species=labels,
         lattice=lattice,
         amplitudes=amplitudes,
+        exponents=fill_exponents,
         enforce_sum_rule=enforce_sum_rule,
         layer_resolved=layer_resolved,
         fill_zero_mean=fill_zero_mean,
@@ -1892,6 +1960,14 @@ def print_monopole_tail_summary(info):
         print(f"  sign(A_B) vs Delta q      : {'OK' if ok else 'FAILED'}")
     print("")
     print("  application")
+    if app.get("fill_exponents"):
+        chosen = fit.get("fill_exponent_groups", {})
+        print("")
+        print(f"  fill radial law  (mode '{fit.get('fill_exponent_mode')}')")
+        for key, power in sorted(app["fill_exponents"].items()):
+            note = "measured" if key in chosen else "assumed (exponent not well determined)"
+            print(f"    {key:<10} dF_rad = A * r^{power:+.3f}   {note}")
+    print("")
     print(f"    atoms filled analytically : {app['n_atoms_filled']}")
     if app.get("fill_radius_max_A") is not None:
         print(
