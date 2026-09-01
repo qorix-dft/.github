@@ -39,7 +39,9 @@ import numpy as np
 from pl_embedding import (
     Photoluminescence,
     _fit_radial_amplitude,
+    amplitude_keys,
     defect_displacements,
+    layer_indices,
     locate_minority_species_atom,
     species_labels_from_counts,
     apply_analytic_tail_to_difference,
@@ -153,6 +155,7 @@ def build_difference_force(outcar_es, outcar_gs, target_poscar, mode, args):
             enforce_sum_rule=True,
             layer_resolved=args.layer_resolved,
             fill_zero_mean=args.fill_zero_mean,
+            fill_radius_max=args.fill_radius_max,
             verbose=True,
         )
     elif mode != "raw":
@@ -230,6 +233,14 @@ def main():
         help="fit and fill one amplitude per species AND layer, instead of one per species",
     )
     parser.add_argument(
+        "--fill-radius-max",
+        type=float,
+        default=None,
+        help="stop filling beyond this radius in A and leave truncation in place there; the "
+             "amplitude is extrapolated well past its fit window, and past some radius that "
+             "extrapolation may be worth less than the zero it replaces",
+    )
+    parser.add_argument(
         "--fill-zero-mean",
         action="store_true",
         help="remove each group's mean over the filled atoms so the fill contributes no net "
@@ -255,7 +266,7 @@ def main():
     args = parser.parse_args()
 
     import pl_embedding
-    require_api_level(6, caller="validate_tail.py")
+    require_api_level(7, caller="validate_tail.py")
 
     pl = Photoluminescence()
 
@@ -415,6 +426,10 @@ def main():
         nz = r_vec > 0
         R_hat[nz] = R_vec[nz] / r_vec[nz, None]
         labels = species_labels_from_counts(species_names, counts)
+        layers = layer_indices(lattice, positions_ref)
+        audit_keys = amplitude_keys(
+            labels, layers, int(layers[defect_index_used]), args.layer_resolved
+        )
         truth = dF_all[REFERENCE_CASE]
         truth_norm = float(np.linalg.norm(truth[fill]))
 
@@ -442,8 +457,9 @@ def main():
               f"{'median(truth)':>15}{'R^2 of truth':>14}")
         fitted_amps = (tail_info_all.get("tail+SR") or {}).get("amplitudes_eVA", {})
         truth_rad = np.einsum("ij,ij->i", truth, R_hat)
-        for s in dict.fromkeys(species_names):
-            sel = fill & (np.array([str(x) for x in labels]) == str(s))
+        key_strings = np.array([str(x) for x in audit_keys])
+        for s in dict.fromkeys(key_strings.tolist()):
+            sel = fill & (key_strings == s)
             if int(np.sum(sel)) < 3:
                 continue
             t = _fit_radial_amplitude(truth_rad[sel], r_vec[sel])
@@ -489,6 +505,41 @@ def main():
     for c in CASES:
         ratio = stot_all[c] / stot_all[REFERENCE_CASE]
         print(f"  {c:<16}{stot_all[c]:>14.6f}{ratio:>9.4f}{100.0 * (ratio - 1.0):>9.2f}%")
+
+    print("")
+    print(" Where the S_tot error lives   [case - reference, in absolute S units]")
+    print("  from the unbroadened mode sums, so the rows add up to the S_tot error")
+    header = f"  {'window (meV)':<16}"
+    for c in CASES[:-1]:
+        header += f"{c:>14}"
+    print(header)
+    print("  " + "-" * (16 + 14 * (len(CASES) - 1)))
+    totals = {c: 0.0 for c in CASES[:-1]}
+    for i, (lo, hi) in enumerate(WINDOWS_MEV):
+        if (lo, hi) == (0.0, 10.0):
+            continue  # overlaps 0-5; the disjoint set is what must add up
+        row = f"  {f'{lo:g} - {hi:g}':<16}"
+        for c in CASES[:-1]:
+            d = raw_all[c][i] - ref_raw[i]
+            totals[c] += d
+            row += f"{d:>+14.4f}"
+        print(row)
+    row = f"  {'5 - 10 (implied)':<16}"
+    i5, i10 = WINDOWS_MEV.index((0.0, 5.0)), WINDOWS_MEV.index((0.0, 10.0))
+    for c in CASES[:-1]:
+        d = (raw_all[c][i10] - raw_all[c][i5]) - (ref_raw[i10] - ref_raw[i5])
+        totals[c] += d
+        row += f"{d:>+14.4f}"
+    print(row)
+    print("  " + "-" * (16 + 14 * (len(CASES) - 1)))
+    row = f"  {'sum':<16}"
+    for c in CASES[:-1]:
+        row += f"{totals[c]:>+14.4f}"
+    print(row)
+    row = f"  {'S_tot - reference':<16}"
+    for c in CASES[:-1]:
+        row += f"{stot_all[c] - stot_all[REFERENCE_CASE]:>+14.4f}"
+    print(row)
 
     # ---- criterion C3 --------------------------------------------------------
     q_vectors, hkl = smallest_nonzero_q(

@@ -27,7 +27,7 @@ import matplotlib.pyplot as plt
 # Bump whenever the public API gains or changes a parameter. The companion
 # scripts check it, so copying one file to a cluster without the other fails
 # with a message naming both paths instead of a TypeError deep in a call stack.
-API_LEVEL = 6
+API_LEVEL = 7
 
 
 def require_api_level(minimum, caller="this script"):
@@ -1049,7 +1049,8 @@ def _fit_radial_amplitude(dF_rad, r):
             "n_atoms": 0, "amplitude_eVA": 0.0, "amplitude_mean_eVA": 0.0,
             "amplitude_median_eVA": 0.0, "amplitude_spread_percent": float("nan"),
             "r_squared": float("nan"),
-            "loglog_exponent": float("nan"), "n_sign_consistent": 0,
+            "loglog_exponent": float("nan"), "loglog_correlation": float("nan"),
+            "n_sign_consistent": 0,
         }
 
     # Three estimators of the same amplitude. Ordinary least squares on
@@ -1073,11 +1074,21 @@ def _fit_radial_amplitude(dF_rad, r):
         if amplitude != 0.0
         else np.zeros_like(dF_rad, dtype=bool)
     )
+    # A slope is only meaningful if log|dF_rad| actually tracks log r. Over a
+    # narrow shell the range in log r is small, so scatter alone can produce an
+    # arbitrarily steep slope -- a shell of 12 atoms once returned +630. Report
+    # the exponent only when the two are correlated well enough for the slope to
+    # mean something, and record the correlation so the reader can judge.
+    exponent = float("nan")
+    correlation = float("nan")
     if int(np.sum(same_sign)) >= 3:
-        slope, _ = np.polyfit(np.log(r[same_sign]), np.log(np.abs(dF_rad[same_sign])), 1)
-        exponent = float(slope)
-    else:
-        exponent = float("nan")
+        log_r = np.log(r[same_sign])
+        log_y = np.log(np.abs(dF_rad[same_sign]))
+        if np.std(log_r) > 0 and np.std(log_y) > 0:
+            correlation = float(np.corrcoef(log_r, log_y)[0, 1])
+            if abs(correlation) >= 0.2:
+                slope, _ = np.polyfit(log_r, log_y, 1)
+                exponent = float(slope)
 
     return {
         "n_atoms": n,
@@ -1091,6 +1102,7 @@ def _fit_radial_amplitude(dF_rad, r):
         ),
         "r_squared": r_squared,
         "loglog_exponent": exponent,
+        "loglog_correlation": correlation,
         "n_sign_consistent": int(np.sum(same_sign)),
     }
 
@@ -1446,13 +1458,14 @@ def fit_monopole_tail(
     fitted = [s for s in unique_species if not per_species[s]["skipped"]]
     sel_all = in_window & np.isin(species.astype(str), np.array([str(s) for s in fitted]))
     positive = sel_all & (np.abs(dF_rad) > 0)
+    exponent_all = float("nan")
     if int(np.sum(positive)) >= 3:
-        slope, _ = np.polyfit(
-            np.log(r[positive]), np.log(np.abs(dF_rad[positive])), 1
-        )
-        exponent_all = float(slope)
-    else:
-        exponent_all = float("nan")
+        log_r, log_y = np.log(r[positive]), np.log(np.abs(dF_rad[positive]))
+        if np.std(log_r) > 0 and np.std(log_y) > 0 and abs(
+            float(np.corrcoef(log_r, log_y)[0, 1])
+        ) >= 0.2:
+            slope, _ = np.polyfit(log_r, log_y, 1)
+            exponent_all = float(slope)
 
     if np.isfinite(exponent_all) and not (
         float(exponent_bounds[0]) <= exponent_all <= float(exponent_bounds[1])
@@ -1543,6 +1556,7 @@ def apply_monopole_tail(
     enforce_sum_rule=True,
     layer_resolved=False,
     fill_zero_mean=False,
+    fill_radius_max=None,
     exact_minimum_image=True,
 ):
     """
@@ -1582,6 +1596,16 @@ def apply_monopole_tail(
     keys = amplitude_keys(species, layers_all, defect_layer, layer_resolved)
 
     unmatched = target_to_unit < 0
+    n_beyond_fill_limit = 0
+    if fill_radius_max is not None:
+        # The amplitude was fitted over a window and is being extrapolated well
+        # past it. Beyond some radius that extrapolation is worth less than the
+        # zero it replaces, so the fill can be stopped and truncation left in
+        # place there. Where to stop is an empirical question, not a principled
+        # one, which is why there is no default.
+        beyond = unmatched & (r > float(fill_radius_max))
+        n_beyond_fill_limit = int(np.sum(beyond))
+        unmatched = unmatched & ~beyond
     n_filled = int(np.sum(unmatched))
 
     if n_filled and np.any(r[unmatched] <= 0.0):
@@ -1653,6 +1677,8 @@ def apply_monopole_tail(
         "sum_rule_enforced": bool(enforce_sum_rule),
         "layer_resolved": bool(layer_resolved),
         "fill_zero_mean": bool(fill_zero_mean),
+        "fill_radius_max_A": fill_radius_max,
+        "n_left_truncated_beyond_fill_limit": n_beyond_fill_limit,
         "abs_fill_net_force_before_eVA": float(np.linalg.norm(fill_net_before)),
         "abs_fill_net_force_after_eVA": (
             float(np.linalg.norm(dF_corrected[unmatched].sum(axis=0))) if n_filled else 0.0
@@ -1677,6 +1703,7 @@ def apply_analytic_tail_to_difference(
     enforce_sum_rule=True,
     layer_resolved=False,
     fill_zero_mean=False,
+    fill_radius_max=None,
     exact_minimum_image=True,
     verbose=True,
 ):
@@ -1759,6 +1786,7 @@ def apply_analytic_tail_to_difference(
         enforce_sum_rule=enforce_sum_rule,
         layer_resolved=layer_resolved,
         fill_zero_mean=fill_zero_mean,
+        fill_radius_max=fill_radius_max,
         exact_minimum_image=exact_minimum_image,
     )
 
@@ -1865,6 +1893,11 @@ def print_monopole_tail_summary(info):
     print("")
     print("  application")
     print(f"    atoms filled analytically : {app['n_atoms_filled']}")
+    if app.get("fill_radius_max_A") is not None:
+        print(
+            f"    left truncated beyond {app['fill_radius_max_A']:.1f} A : "
+            f"{app['n_left_truncated_beyond_fill_limit']} atoms"
+        )
     print(
         f"    their radial range        : {app['filled_r_min_A']:.2f} - "
         f"{app['filled_r_max_A']:.2f} A"
