@@ -605,8 +605,26 @@ def main():
     for c in CASES[:-1]:
         row += f"{totals[c] - (raw_all[c][i_opt_w] - ref_raw[i_opt_w]):>+14.4f}"
     print(row)
+    # A signed sum over windows cancels the same way the total does, one level down:
+    # a case with a larger negative error in one window can post a smaller signed sum
+    # while being less accurate everywhere. The sum of absolute window errors cannot,
+    # so it is the one to rank on.
+    row = f"  {'sum |error| < 150':<16}"
+    for c in CASES[:-1]:
+        total_abs = 0.0
+        for i, (lo, hi) in enumerate(WINDOWS_MEV):
+            if (lo, hi) in ((0.0, 10.0), (150.0, 220.0)):
+                continue
+            total_abs += abs(raw_all[c][i] - ref_raw[i])
+        total_abs += abs(
+            (raw_all[c][i10] - raw_all[c][i5]) - (ref_raw[i10] - ref_raw[i5])
+        )
+        row += f"{total_abs:>14.4f}"
+    print(row)
     print("  the optical row is present in every case including truncation, so it is not the")
-    print("  tail's; a small total can be two large errors either side of 150 meV cancelling")
+    print("  tail's. Rank on the absolute row: a signed sum can be small because two large")
+    print("  errors either side of 150 meV cancel, or because errors within the sub-optical")
+    print("  windows cancel each other.")
     row = f"  {'S_tot - reference':<16}"
     for c in CASES[:-1]:
         row += f"{stot_all[c] - stot_all[REFERENCE_CASE]:>+14.4f}"
