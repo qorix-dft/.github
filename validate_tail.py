@@ -156,6 +156,8 @@ def build_difference_force(outcar_es, outcar_gs, target_poscar, mode, args):
             layer_resolved=args.layer_resolved,
             fill_zero_mean=args.fill_zero_mean,
             fill_radius_max=args.fill_radius_max,
+            fill_exponent_mode=args.fill_exponent,
+            fill_exponent_min_r2=args.fill_exponent_min_r2,
             verbose=True,
         )
     elif mode != "raw":
@@ -233,6 +235,19 @@ def main():
         help="fit and fill one amplitude per species AND layer, instead of one per species",
     )
     parser.add_argument(
+        "--fill-exponent",
+        choices=("fixed", "fitted", "auto"),
+        default="fixed",
+        help="radial law for the fill: 'fixed' is A/r^2 as before, 'fitted' uses each group's "
+             "measured exponent, 'auto' uses it only where the fit was good enough",
+    )
+    parser.add_argument(
+        "--fill-exponent-min-r2",
+        type=float,
+        default=0.8,
+        help="R^2 a group's fit must reach before 'auto' trusts its measured exponent",
+    )
+    parser.add_argument(
         "--fill-radius-max",
         type=float,
         default=None,
@@ -266,7 +281,7 @@ def main():
     args = parser.parse_args()
 
     import pl_embedding
-    require_api_level(7, caller="validate_tail.py")
+    require_api_level(8, caller="validate_tail.py")
 
     pl = Photoluminescence()
 
