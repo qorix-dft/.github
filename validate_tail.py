@@ -281,7 +281,7 @@ def main():
     args = parser.parse_args()
 
     import pl_embedding
-    require_api_level(8, caller="validate_tail.py")
+    require_api_level(9, caller="validate_tail.py")
 
     pl = Photoluminescence()
 
@@ -498,26 +498,43 @@ def main():
         print("  scores above 1.000 is further from the truth than leaving the region empty.")
 
         print("")
-        print("  Amplitude the reference's own field wants over the atoms the tail actually")
-        print("  filled, against the amplitude fitted from the window and used for the fill:")
-        print(f"    {'species':<9}{'A fitted':>13}{'A from truth':>15}{'ratio':>9}"
-              f"{'median(truth)':>15}{'R^2 of truth':>14}")
-        fitted_amps = (tail_info_all.get("tail+SR") or {}).get("amplitudes_eVA", {})
+        print("  What the fill put down over the atoms it actually filled, against the")
+        print("  reference's own field there. The truth is refitted at each group's own fill")
+        print("  exponent, since an r^-2 amplitude and an r^-2.6 amplitude are different")
+        print("  quantities and cannot be divided by one another.")
+        print(f"    {'species':<9}{'exponent':>10}{'A fitted':>13}{'A truth':>13}{'ratio':>8}"
+              f"{'median fill/true':>18}{'R^2 of truth':>14}")
+        tail_info = tail_info_all.get("tail+SR") or {}
+        fitted_amps = tail_info.get("amplitudes_eVA", {})
+        fill_powers = (tail_info.get("apply_stats") or {}).get("fill_exponents") or {}
         truth_rad = np.einsum("ij,ij->i", truth, R_hat)
         key_strings = np.array([str(x) for x in audit_keys])
         for s in dict.fromkeys(key_strings.tolist()):
             sel = treated & (key_strings == s)
             if int(np.sum(sel)) < 3:
                 continue
-            t = _fit_radial_amplitude(truth_rad[sel], r_vec[sel])
+            power = float(fill_powers.get(str(s), -2.0))
             a_fit = float(fitted_amps.get(str(s), float("nan")))
+            t = _fit_radial_amplitude(truth_rad[sel], r_vec[sel], fixed_exponent=power)
             ratio = a_fit / t["amplitude_eVA"] if t["amplitude_eVA"] != 0 else float("nan")
-            print(f"    {str(s):<9}{a_fit:>13.4f}{t['amplitude_eVA']:>15.4f}{ratio:>9.2f}"
-                  f"{t['amplitude_median_eVA']:>15.4f}{t['r_squared']:>14.4f}")
+
+            # Exponent free, and the number that actually says whether the fill is
+            # the right size: what it put down divided by what is there, atom by atom.
+            predicted = a_fit * r_vec[sel] ** power
+            actual = truth_rad[sel]
+            usable = np.abs(actual) > 0
+            median_ratio = (
+                float(np.median(predicted[usable] / actual[usable]))
+                if int(np.sum(usable)) else float("nan")
+            )
+            print(f"    {str(s):<9}{power:>10.3f}{a_fit:>13.4f}{t['amplitude_eVA']:>13.4f}"
+                  f"{ratio:>8.2f}{median_ratio:>18.2f}{t['r_squared']:>14.4f}")
         print("")
-        print("  A ratio far from 1 means the window the amplitude was fitted in does not")
-        print("  describe the region it is being extrapolated into. A low R^2 in the last")
-        print("  column means no single amplitude describes that region either.")
+        print("")
+        print("  Either ratio far from 1 means the window the fill was fitted in does not")
+        print("  describe the region it is extrapolated into: above 1 the fill overshoots,")
+        print("  below 1 it undershoots. A low R^2 in the last column means no single")
+        print("  amplitude describes that region at any exponent.")
 
     ref_integ = integ_all[REFERENCE_CASE]
     ref_raw = raw_all[REFERENCE_CASE]

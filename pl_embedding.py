@@ -27,7 +27,7 @@ import matplotlib.pyplot as plt
 # Bump whenever the public API gains or changes a parameter. The companion
 # scripts check it, so copying one file to a cluster without the other fails
 # with a message naming both paths instead of a TypeError deep in a call stack.
-API_LEVEL = 8
+API_LEVEL = 9
 
 
 def require_api_level(minimum, caller="this script"):
@@ -1032,9 +1032,14 @@ def enforce_force_sum_rule(dF):
     return dF_corrected, stats
 
 
-def _fit_radial_amplitude(dF_rad, r):
+def _fit_radial_amplitude(dF_rad, r, fixed_exponent=None):
     """
     One zero-intercept least squares fit of dF_rad against r^-2.
+
+    fixed_exponent refits at a given power instead, dF_rad = A r^p. The
+    amplitude of an r^-2 fit and the amplitude of an r^-2.6 fit are different
+    quantities with different units, so anything comparing two amplitudes must
+    put both at the same exponent first.
 
     A = sum(dF_rad * r^-2) / sum(r^-4), plus the R^2 of that fit and an
     independent log-log slope, which is the honest test of the assumed
@@ -1060,9 +1065,10 @@ def _fit_radial_amplitude(dF_rad, r):
     # weights every atom equally, and its median is insensitive to outliers.
     # If the 1/r^2 model holds, all three agree. If they do not, the spread is
     # the honest uncertainty on A and the model is the thing at fault.
-    x = r ** -2.0
+    power = -2.0 if fixed_exponent is None else float(fixed_exponent)
+    x = r ** power
     amplitude = float(np.sum(dF_rad * x) / np.sum(x ** 2))
-    per_atom = dF_rad * r ** 2
+    per_atom = dF_rad * r ** (-power)
     amplitude_mean = float(np.mean(per_atom))
     amplitude_median = float(np.median(per_atom))
 

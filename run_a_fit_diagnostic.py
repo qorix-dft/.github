@@ -275,7 +275,7 @@ def main():
     args = parser.parse_args()
 
     import pl_embedding
-    require_api_level(8, caller="run_a_fit_diagnostic.py")
+    require_api_level(9, caller="run_a_fit_diagnostic.py")
 
     override = {
         "A1": (args.outcar_15x9_ex, args.outcar_15x9_gs, args.poscar_15x9),
