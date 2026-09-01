@@ -45,6 +45,7 @@ from pl_embedding import (
     locate_minority_species_atom,
     read_last_total_force_block,
     read_poscar,
+    require_api_level,
     species_labels_from_counts,
 )
 
@@ -273,6 +274,9 @@ def main():
     parser.add_argument("--extrapolation-radius", type=float, default=EXTRAPOLATION_RADIUS_A)
     args = parser.parse_args()
 
+    import pl_embedding
+    require_api_level(6, caller="run_a_fit_diagnostic.py")
+
     override = {
         "A1": (args.outcar_15x9_ex, args.outcar_15x9_gs, args.poscar_15x9),
         "A2": (args.outcar_10x8_ex, args.outcar_10x8_gs, args.poscar_10x8),
@@ -284,6 +288,7 @@ def main():
     print("=" * 78)
     print(" RUN A: STANDALONE MONOPOLE FIT DIAGNOSTIC")
     print(" self-fit of the reference field; no target, no fill, no sum rule")
+    print(f"  pl_embedding      : {pl_embedding.__file__}  (API level {pl_embedding.API_LEVEL})")
     print("=" * 78)
 
     results = {}

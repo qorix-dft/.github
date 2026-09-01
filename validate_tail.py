@@ -51,6 +51,7 @@ from pl_embedding import (
     force_structure_factor,
     phonon_species_order_message,
     read_poscar,
+    require_api_level,
     smallest_nonzero_q,
     verify_defect_correspondence,
 )
@@ -150,6 +151,8 @@ def build_difference_force(outcar_es, outcar_gs, target_poscar, mode, args):
             defect_index=args.defect_index,
             fit_window=(args.fit_lo, args.fit_hi),
             enforce_sum_rule=True,
+            layer_resolved=args.layer_resolved,
+            fill_zero_mean=args.fill_zero_mean,
             verbose=True,
         )
     elif mode != "raw":
@@ -222,6 +225,17 @@ def main():
     parser.add_argument("--sigma", type=float, default=SIGMA_MEV)
     parser.add_argument("--n-q", type=int, default=N_Q_SMALLEST)
     parser.add_argument(
+        "--layer-resolved",
+        action="store_true",
+        help="fit and fill one amplitude per species AND layer, instead of one per species",
+    )
+    parser.add_argument(
+        "--fill-zero-mean",
+        action="store_true",
+        help="remove each group's mean over the filled atoms so the fill contributes no net "
+             "force and no mass-weighted q=0 component; truncation already gets q=0 right",
+    )
+    parser.add_argument(
         "--no-align-defects",
         dest="align_defects",
         action="store_false",
@@ -239,6 +253,9 @@ def main():
         help="include reciprocal vectors along the vacuum direction in the C3 table",
     )
     args = parser.parse_args()
+
+    import pl_embedding
+    require_api_level(6, caller="validate_tail.py")
 
     pl = Photoluminescence()
 
@@ -268,6 +285,7 @@ def main():
     print("=" * 74)
     print(f"  target            : {args.target_poscar}  ({n_atoms} atoms, {species_names} {counts})")
     print(f"  modes             : {args.band_yaml}  ({modes.shape[0]} modes)")
+    print(f"  pl_embedding      : {pl_embedding.__file__}  (API level {pl_embedding.API_LEVEL})")
     print(f"  phonon/target     : consistent  [{', '.join(species_check['tests_run'])}]"
           + ("" if species_check["symbols_available"] else "; no symbols in band.yaml"))
     print(f"  Delta q           : {args.delta_q:+d}")

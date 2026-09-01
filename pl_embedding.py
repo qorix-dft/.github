@@ -24,6 +24,33 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 
+# Bump whenever the public API gains or changes a parameter. The companion
+# scripts check it, so copying one file to a cluster without the other fails
+# with a message naming both paths instead of a TypeError deep in a call stack.
+API_LEVEL = 6
+
+
+def require_api_level(minimum, caller="this script"):
+    """
+    Fail early and legibly when pl_embedding is older than the caller expects.
+
+    These files get copied between machines one at a time. Without this check a
+    stale module surfaces as an unexpected-keyword TypeError from somewhere deep
+    in the call stack, which says nothing about the real cause.
+    """
+    import os
+
+    if API_LEVEL < int(minimum):
+        raise ImportError(
+            f"{caller} needs pl_embedding API level {int(minimum)} or newer, but the "
+            f"pl_embedding.py it imported is level {API_LEVEL}.\n"
+            f"  loaded from : {os.path.abspath(__file__)}\n"
+            "  The two files are versioned together. Copy the matching pl_embedding.py "
+            "next to the script, or put the current one first on PYTHONPATH."
+        )
+    return API_LEVEL
+
+
 # =============================================================================
 # Helpers: POSCAR/CONTCAR reader
 # =============================================================================
@@ -956,6 +983,29 @@ def layer_indices(lattice, positions, tolerance=1.0):
     return layers
 
 
+def amplitude_keys(species, layers, defect_layer, layer_resolved):
+    """
+    The grouping the monopole amplitude is fitted and applied over.
+
+    Without layer resolution that is the species alone, which is what the Born
+    effective charge depends on in a bulk crystal. In a slab it is not enough:
+    an atom in the defect's own layer sits in a different screening environment
+    from one a layer away at the same distance, and averaging them gives an
+    amplitude that is wrong for both.
+
+    Returns:
+        keys (N,) object array, either "B" or "B|L+0" style.
+    """
+    species = np.asarray(species, dtype=object)
+    if not layer_resolved:
+        return np.array([str(s) for s in species], dtype=object)
+    layers = np.asarray(layers, dtype=int)
+    return np.array(
+        [f"{s}|L{int(l) - int(defect_layer):+d}" for s, l in zip(species, layers)],
+        dtype=object,
+    )
+
+
 def enforce_force_sum_rule(dF):
     """
     Re-impose the acoustic (translational) sum rule sum_a dF_a = 0.
@@ -1062,6 +1112,7 @@ def fit_monopole_tail(
     extrapolation_radius=None,
     drift_tolerance_percent=5.0,
     drift_noise_floor_percent=1.0,
+    layer_resolved=False,
     exact_minimum_image=True,
     verbose=True,
 ):
@@ -1161,9 +1212,14 @@ def fit_monopole_tail(
     nonzero = r > 0
     R_hat[nonzero] = R[nonzero] / r[nonzero, None]
     dF_rad = np.einsum("ij,ij->i", dF, R_hat)
+    raw_species = species.copy()
 
     unmatched = ~matched
-    unique_species = [s for s in dict.fromkeys(species.tolist())]
+    layers_all = layer_indices(lattice, positions)
+    defect_layer = int(layers_all[int(defect_index)])
+    keys = amplitude_keys(species, layers_all, defect_layer, layer_resolved)
+    unique_species = [s for s in dict.fromkeys(keys.tolist())]
+    species = keys
 
     amplitudes = {}
     per_species = {}
@@ -1370,15 +1426,12 @@ def fit_monopole_tail(
 
     # ---- layer-resolved diagnostic ----------------------------------------
     # Pure reporting: it does not change the amplitudes used for the fill.
-    layers = layer_indices(lattice, positions)
-    defect_layer = int(layers[int(defect_index)])
+    layers = layers_all
     per_species_layer = {}
-    for s in unique_species:
-        if per_species[s]["skipped"]:
-            continue
+    for s in [x for x in dict.fromkeys(raw_species.tolist())]:
         rows = []
         for L in sorted(set(layers.tolist())):
-            sel_L = in_window & (species == s) & (layers == L)
+            sel_L = in_window & (raw_species == s) & (layers == L)
             n_L = int(np.sum(sel_L))
             row = {"layer": L, "relative_to_defect": L - defect_layer, "n_atoms": n_L}
             if n_L >= 3:
@@ -1387,7 +1440,8 @@ def fit_monopole_tail(
                 row.update({"amplitude_eVA": float("nan"), "r_squared": float("nan"),
                             "loglog_exponent": float("nan")})
             rows.append(row)
-        per_species_layer[s] = rows
+        if any(row["n_atoms"] >= 3 for row in rows):
+            per_species_layer[s] = rows
 
     fitted = [s for s in unique_species if not per_species[s]["skipped"]]
     sel_all = in_window & np.isin(species.astype(str), np.array([str(s) for s in fitted]))
@@ -1409,9 +1463,16 @@ def fit_monopole_tail(
             "or the transition is not monopole dominated."
         )
 
+    def _key_for(element):
+        if element in amplitudes:
+            return element
+        candidate = f"{element}|L+0"
+        return candidate if candidate in amplitudes else None
+
+    key_B, key_N = _key_for("B"), _key_for("N")
     ratio_B_over_N = float("nan")
-    if "B" in amplitudes and "N" in amplitudes and amplitudes["N"] != 0.0:
-        ratio_B_over_N = amplitudes["B"] / amplitudes["N"]
+    if key_B and key_N and amplitudes[key_N] != 0.0:
+        ratio_B_over_N = amplitudes[key_B] / amplitudes[key_N]
         if abs(ratio_B_over_N + 1.0) > 0.2:
             warnings.append(
                 f"A_B / A_N = {ratio_B_over_N:.3f}, expected near -1 "
@@ -1419,9 +1480,9 @@ def fit_monopole_tail(
             )
 
     sign_check = None
-    if delta_q is not None and "B" in amplitudes and not per_species["B"]["skipped"]:
+    if delta_q is not None and key_B and not per_species[key_B]["skipped"]:
         expected = float(np.sign(delta_q))
-        observed = float(np.sign(amplitudes["B"]))
+        observed = float(np.sign(amplitudes[key_B]))
         sign_check = {"expected_sign_A_B": expected, "observed_sign_A_B": observed}
         if observed != expected:
             warnings.append(
@@ -1446,6 +1507,7 @@ def fit_monopole_tail(
         "exact_minimum_image": bool(exact_minimum_image),
         "orthogonal_lattice": bool(is_orthogonal_lattice(lattice)),
         "n_images_refined": n_refined,
+        "layer_resolved": bool(layer_resolved),
         "sub_windows_A": requested_sub,
         "drift_windows_explicit": drift_windows_explicit,
         "extrapolation_radius_A": extrap_r,
@@ -1479,6 +1541,8 @@ def apply_monopole_tail(
     lattice,
     amplitudes,
     enforce_sum_rule=True,
+    layer_resolved=False,
+    fill_zero_mean=False,
     exact_minimum_image=True,
 ):
     """
@@ -1513,6 +1577,10 @@ def apply_monopole_tail(
         lattice, positions, defect_index, exact_minimum_image=exact_minimum_image
     )
 
+    layers_all = layer_indices(lattice, positions)
+    defect_layer = int(layers_all[int(defect_index)])
+    keys = amplitude_keys(species, layers_all, defect_layer, layer_resolved)
+
     unmatched = target_to_unit < 0
     n_filled = int(np.sum(unmatched))
 
@@ -1522,7 +1590,7 @@ def apply_monopole_tail(
             "there. Check tail_defect_index."
         )
 
-    missing = sorted({str(s) for s in species[unmatched]} - {str(k) for k in amplitudes})
+    missing = sorted({str(s) for s in keys[unmatched]} - {str(k) for k in amplitudes})
     if missing:
         raise ValueError(
             f"No fitted amplitude for species {missing}, which have unmatched atoms to fill."
@@ -1536,11 +1604,28 @@ def apply_monopole_tail(
     net_before = dF.sum(axis=0)
 
     dF_corrected = dF.copy()
+    fill_net_before = np.zeros(3)
     if n_filled:
         idx = np.where(unmatched)[0]
-        A = np.array([amplitudes[str(species[i])] for i in idx], dtype=float)
+        A = np.array([amplitudes[str(keys[i])] for i in idx], dtype=float)
         R_hat = R[idx] / r[idx, None]
         dF_corrected[idx] = (A / r[idx] ** 2)[:, None] * R_hat
+        fill_net_before = dF_corrected[idx].sum(axis=0)
+
+        if fill_zero_mean:
+            # Truncation already gets the q = 0 content right: with a bijective
+            # mapping the matched region reproduces the reference's own net force,
+            # ~1e-5 eV/A. The fill is there to supply the FINITE-q content that
+            # truncation is missing, and should not touch q = 0 at all. Removing
+            # each group's mean over the filled atoms makes the fill contribute
+            # zero net force, and because the mass is constant within a group it
+            # also leaves sum_a m_a^(-1/2) dF_a untouched -- which a single global
+            # mean subtraction does not, since it spreads the imbalance over every
+            # atom and injects it back into the mass-weighted channel instead.
+            for key in dict.fromkeys(keys[idx].tolist()):
+                group = idx[keys[idx] == key]
+                if group.size:
+                    dF_corrected[group] -= dF_corrected[group].mean(axis=0)
 
     abs_sum_tail = float(np.sum(np.abs(dF_corrected[unmatched]))) if n_filled else 0.0
     abs_sum_after = float(np.sum(np.abs(dF_corrected)))
@@ -1566,6 +1651,12 @@ def apply_monopole_tail(
             else float(np.linalg.norm(net_after_fill))
         ),
         "sum_rule_enforced": bool(enforce_sum_rule),
+        "layer_resolved": bool(layer_resolved),
+        "fill_zero_mean": bool(fill_zero_mean),
+        "abs_fill_net_force_before_eVA": float(np.linalg.norm(fill_net_before)),
+        "abs_fill_net_force_after_eVA": (
+            float(np.linalg.norm(dF_corrected[unmatched].sum(axis=0))) if n_filled else 0.0
+        ),
         "minimum_image_radius_A": mic_radius,
         "n_filled_beyond_minimum_image_radius": n_beyond_mic,
         "n_filled_image_ambiguous": n_ambiguous,
@@ -1584,6 +1675,8 @@ def apply_analytic_tail_to_difference(
     defect_index=None,
     fit_window=(6.0, 16.0),
     enforce_sum_rule=True,
+    layer_resolved=False,
+    fill_zero_mean=False,
     exact_minimum_image=True,
     verbose=True,
 ):
@@ -1650,6 +1743,7 @@ def apply_analytic_tail_to_difference(
         lattice=lattice,
         r_fit=fit_window,
         delta_q=delta_q,
+        layer_resolved=layer_resolved,
         exact_minimum_image=exact_minimum_image,
         verbose=verbose,
     )
@@ -1663,6 +1757,8 @@ def apply_analytic_tail_to_difference(
         lattice=lattice,
         amplitudes=amplitudes,
         enforce_sum_rule=enforce_sum_rule,
+        layer_resolved=layer_resolved,
+        fill_zero_mean=fill_zero_mean,
         exact_minimum_image=exact_minimum_image,
     )
 
@@ -1697,6 +1793,10 @@ def print_monopole_tail_summary(info):
         f"{'auto-located' if info['defect_auto_located'] else 'user-specified'}"
     )
     print(f"  Delta q                : {info['delta_q']:+g}")
+    print(
+        f"  amplitude grouping     : "
+        + ("species x layer" if fit.get("layer_resolved") else "species only")
+    )
     print(f"  matched / unmatched    : {fit['n_matched']} / {fit['n_unmatched']} atoms")
     print(f"  matched region r_max   : {fit['matched_r_max_A']:.2f} A")
     print(f"  minimum-image radius   : {fit['minimum_image_radius_A']:.2f} A")
@@ -1781,6 +1881,11 @@ def print_monopole_tail_summary(info):
             f"    nearest image ambiguous   : {app['n_filled_image_ambiguous']} of "
             f"{app['n_atoms_filled']}"
         )
+    print(
+        f"    fill's own net force      : {app['abs_fill_net_force_before_eVA']:.3e} -> "
+        f"{app['abs_fill_net_force_after_eVA']:.3e} eV/A"
+        + ("  (group means removed)" if app["fill_zero_mean"] else "  (not zeroed)")
+    )
     print(f"    |sum dF| before fill      : {app['abs_net_force_before_eVA']:.3e} eV/A")
     print(f"    |sum dF| after fill       : {app['abs_net_force_after_fill_eVA']:.3e} eV/A")
     print(
