@@ -51,6 +51,7 @@ from pl_embedding import (
     force_structure_factor,
     phonon_species_order_message,
     read_poscar,
+    require_api_level,
     smallest_nonzero_q,
     verify_defect_correspondence,
 )
@@ -253,6 +254,9 @@ def main():
     )
     args = parser.parse_args()
 
+    import pl_embedding
+    require_api_level(6, caller="validate_tail.py")
+
     pl = Photoluminescence()
 
     masses, freqs, modes = pl.ReadPhononsPhonopy(args.band_yaml, freq_cutoff=0.1)
@@ -281,6 +285,7 @@ def main():
     print("=" * 74)
     print(f"  target            : {args.target_poscar}  ({n_atoms} atoms, {species_names} {counts})")
     print(f"  modes             : {args.band_yaml}  ({modes.shape[0]} modes)")
+    print(f"  pl_embedding      : {pl_embedding.__file__}  (API level {pl_embedding.API_LEVEL})")
     print(f"  phonon/target     : consistent  [{', '.join(species_check['tests_run'])}]"
           + ("" if species_check["symbols_available"] else "; no symbols in band.yaml"))
     print(f"  Delta q           : {args.delta_q:+d}")

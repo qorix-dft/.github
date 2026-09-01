@@ -24,6 +24,33 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 
+# Bump whenever the public API gains or changes a parameter. The companion
+# scripts check it, so copying one file to a cluster without the other fails
+# with a message naming both paths instead of a TypeError deep in a call stack.
+API_LEVEL = 6
+
+
+def require_api_level(minimum, caller="this script"):
+    """
+    Fail early and legibly when pl_embedding is older than the caller expects.
+
+    These files get copied between machines one at a time. Without this check a
+    stale module surfaces as an unexpected-keyword TypeError from somewhere deep
+    in the call stack, which says nothing about the real cause.
+    """
+    import os
+
+    if API_LEVEL < int(minimum):
+        raise ImportError(
+            f"{caller} needs pl_embedding API level {int(minimum)} or newer, but the "
+            f"pl_embedding.py it imported is level {API_LEVEL}.\n"
+            f"  loaded from : {os.path.abspath(__file__)}\n"
+            "  The two files are versioned together. Copy the matching pl_embedding.py "
+            "next to the script, or put the current one first on PYTHONPATH."
+        )
+    return API_LEVEL
+
+
 # =============================================================================
 # Helpers: POSCAR/CONTCAR reader
 # =============================================================================
