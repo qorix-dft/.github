@@ -536,6 +536,51 @@ def main():
         print("  below 1 it undershoots. A low R^2 in the last column means no single")
         print("  amplitude describes that region at any exponent.")
 
+    # ---- matched-region agreement -------------------------------------------
+    # The fill-region audit scores what the tail invents. This scores what nobody
+    # invented: the 960 atoms both references supply. If the two calculations agree
+    # there, every difference in the spectrum is truncation and the tail is aimed at
+    # the right thing. If they disagree, part of what looks like a truncation error
+    # is a difference between the two calculations, and no fill can remove it.
+    matched = ~mask_all["trunc"]
+    if int(np.sum(matched)) and REFERENCE_CASE in dF_all:
+        small, large = dF_all["trunc"], dF_all[REFERENCE_CASE]
+        norm = float(np.linalg.norm(large[matched]))
+        print("")
+        print(" Matched-region agreement: the two references where they overlap")
+        print(f"  {int(np.sum(matched))} atoms supplied by BOTH the small and the large reference")
+        print("")
+        print(f"  {'shell [A]':<14}{'n':>6}{'sum|dF| small':>15}{'sum|dF| large':>15}"
+              f"{'ratio':>8}{'rel. difference':>18}")
+        print("  " + "-" * 76)
+        edges = [0.0, 4.0, 8.0, 12.0, 16.0, 1e9]
+        for lo, hi in zip(edges[:-1], edges[1:]):
+            sel = matched & (r_vec >= lo) & (r_vec < hi)
+            n_sel = int(np.sum(sel))
+            if not n_sel:
+                continue
+            a = float(np.sum(np.abs(small[sel])))
+            b = float(np.sum(np.abs(large[sel])))
+            d = float(np.linalg.norm(small[sel] - large[sel])) / float(
+                np.linalg.norm(large[sel])
+            ) if float(np.linalg.norm(large[sel])) > 0 else float("nan")
+            label = f"{lo:g} - {hi:g}" if hi < 1e8 else f"{lo:g}+"
+            print(f"  {label:<14}{n_sel:>6}{a:>15.5f}{b:>15.5f}"
+                  f"{(a / b if b else float('nan')):>8.3f}{d:>18.4f}")
+        overall = float(np.linalg.norm(small[matched] - large[matched])) / norm
+        print("  " + "-" * 76)
+        print(f"  {'all matched':<14}{int(np.sum(matched)):>6}"
+              f"{float(np.sum(np.abs(small[matched]))):>15.5f}"
+              f"{float(np.sum(np.abs(large[matched]))):>15.5f}"
+              f"{float(np.sum(np.abs(small[matched]))) / float(np.sum(np.abs(large[matched]))):>8.3f}"
+              f"{overall:>18.4f}")
+        print("")
+        print("  A relative difference near zero means the two calculations agree where they")
+        print("  overlap, so the spectral difference between them is truncation alone. A large")
+        print("  one, especially near the defect, means the references differ in themselves --")
+        print("  settings, k-sampling or relaxation -- and that part is not the tail's to fix")
+        print("  and not removable by any fill.")
+
     ref_integ = integ_all[REFERENCE_CASE]
     ref_raw = raw_all[REFERENCE_CASE]
 
