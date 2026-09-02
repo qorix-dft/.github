@@ -1,0 +1,260 @@
+# =============================================================================
+# ANALYTIC MONOPOLE TAIL FOR CHARGED DEFECT TRANSITIONS IN TRILAYER h-BN
+# Summary of the investigation
+#
+# System      : C_B (Delta q = +1) and C_N (Delta q = -1) in trilayer h-BN
+# Method      : Alkauskas/Razinkovas phonon force-field embedding
+# Code        : pl_embedding.py (API level 9), validate_tail.py,
+#               run_a_fit_diagnostic.py
+# Record      : github.com/qorix-dft/.github pull request #10
+#
+# VERDICT: the analytic monopole tail should NOT be applied to production
+#          numbers. The reason is measured, not judged; see section 6.
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# 1. THE ORIGINAL PROBLEM
+# -----------------------------------------------------------------------------
+# dF = F_ex - F_gs for a localised-to-delocalised transition is the Coulomb
+# field of the transferred charge acting on the host Born effective charges,
+# decaying as 1/r^2. Truncating it at the reference cell boundary (unmatched
+# atoms set to zero) was believed to deposit spurious weight at low phonon
+# energy. The proposed fix was to continue dF analytically past the boundary.
+#
+# Reported boundary forces, against a 0.005 eV/A convergence criterion:
+#   7x5   0.0227 eV/A
+#   10x8  0.0082 eV/A
+#   15x9  0.0057 eV/A
+# None pass; a 1/r^2 field never becomes negligible at an affordable cell size.
+
+
+# -----------------------------------------------------------------------------
+# 2. CELL GEOMETRY (all orthorhombic, rectangular 4-atom representation)
+# -----------------------------------------------------------------------------
+# isotropic radius = half the SHORT in-plane axis; beyond it a radial shell
+# preferentially samples the long axis and the fit is anisotropy biased.
+#
+# cell    a1 (A)    a2 (A)    isotropic (A)   corner r_max (A)   atoms
+# 7x5     17.5457   21.7072    8.77            14.35              420
+# 10x8    25.0653   34.7316   12.53            21.67              960
+# 15x9    37.5979   39.0730   18.80            27.32             1620
+#
+# Target for all validation: 15x9, 1620 atoms, 4860 Gamma modes.
+# Embedding: 10x8 reference -> 15x9 target. 960 atoms matched, 660 zeroed.
+
+
+# -----------------------------------------------------------------------------
+# 3. WHAT WAS BUILT (all default to off; module bit-identical at defaults)
+# -----------------------------------------------------------------------------
+# fit_monopole_tail            per-species/layer least-squares fit of
+#                              dF_rad = A/r^n, with R^2, log-log exponent,
+#                              three amplitude estimators, sub-window drift
+# apply_monopole_tail          fills unmatched atoms; optional per-group
+#                              zero-mean; optional fill radius cap
+# apply_analytic_tail_to_diff. single place where dF is formed and corrected
+# defect_alignment_shift       rigid translation aligning two defect sites
+# verify_defect_correspondence guards against embedding around the wrong site
+# check_phonon_species_order   band.yaml vs POSCAR consistency
+# layer_indices/amplitude_keys grouping used identically by fit and fill
+# force_structure_factor       criterion C3, |F~(q)|
+# require_api_level            fails legibly on a stale module copy
+#
+# validate_tail.py             four-case control + fill-region audit +
+#                              matched-region agreement + S_tot decomposition
+# run_a_fit_diagnostic.py      standalone self-fit, no target/fill/sum rule
+
+
+# -----------------------------------------------------------------------------
+# 4. DEVELOPMENT FINDINGS, IN ORDER
+# -----------------------------------------------------------------------------
+# 4.1 Defect alignment. The 15x9 reference substituted a different site from
+#     the target. A rigid translation of (-6.2663, -2.1706, +0.0044) A, |6.63|,
+#     aligns them: 1620/1620 matched, max match distance 6.2e-06 A on synthetic.
+#
+# 4.2 Unmatched counts are BLIND to a wrong-site embedding. Two 15x9 cells
+#     substituting different sites differ in exactly two atoms, so an unaligned
+#     mapping reads 1618/1620 matched with max distance 0.0000 A while the
+#     embedded dF is 140% wrong. Only the defect-correspondence check catches it.
+#
+# 4.3 The acoustic sum rule was the wrong repair. Truncation with bijective
+#     mapping already satisfies sum_a dF_a = 0 (~1e-5 eV/A). Adding the fill
+#     injected 0.273 eV/A of net force; removing it by a global mean subtraction
+#     spread 1.687e-4 eV/A over all 1620 atoms and shifted the mass-weighted
+#     sum_a m^-1/2 dF_a by 0.078 -- 100x the reference's own 7.8e-4.
+#     Removing each group's mean over the FILLED atoms only fixes both:
+#     fill net force 1.606e-01 -> 7.665e-06 eV/A, F~(0) identical to truncation.
+#
+# 4.4 Layer resolution is required. In a trilayer the defect's own layer is a
+#     different screening environment. Species-only fitting averages them:
+#           grouping            A_B/A_N     (exact value required: -1)
+#           species only        -0.924
+#           defect layer only   -0.996  (C_B)   -0.953 (C_N, all layers)
+#
+# 4.5 The assumed exponent is wrong in the defect layer. It decays as r^-2.35
+#     (B) and r^-2.42 (N) with R^2 0.85/0.93. Fitting A/r^2 over 6-12 A and
+#     extrapolating to 11-27 A gave amplitude ratios 1.32/1.35 against the
+#     reference's own field; honouring the measured exponent gives 1.03/1.01.
+#     Applying measured exponents everywhere is worse: poorly determined ones
+#     extrapolate worse than the assumption (B off-layers 0.80 -> 1.22).
+#
+# 4.6 Both natural acceptance metrics reward cancellation.
+#     |S_tot|: truncation's -0.08% on C_B is +4.27% below 150 meV against
+#              -4.36% in the optical window.
+#     signed sub-optical sum: also cancels one level down.
+#     Use the sum of ABSOLUTE window errors below 150 meV.
+
+
+# -----------------------------------------------------------------------------
+# 5. RESULTS AT THE BEST CONFIGURATION
+#    --fit-hi 12 --layer-resolved --fill-zero-mean
+#    --fill-exponent auto --fill-exponent-min-r2 0.7 --fill-radius-max 18.8
+# -----------------------------------------------------------------------------
+# 5.1 Layer-resolved fits, 6-12 A window
+#
+#     C_B (Delta q = +1)                    C_N (Delta q = -1)
+#     group    A [eV*A]    R^2   exponent   A [eV*A]    R^2   exponent
+      B|L-1      7.5035  0.5695   -1.535     -7.7404  0.6696   -1.655
+      B|L+1      7.5038  0.5671   -1.532     -7.7282  0.6795   -1.722
+      B|L+0     11.8708  0.8543   -2.353    -11.1257  0.8871   -2.340
+      N|L+0    -11.9212  0.9345   -2.416     11.6780  0.9415   -2.339
+      N|L-1     -8.1447  0.7316   -1.851      7.6066  0.6815   -1.611
+      N|L+1     -8.1679  0.7254   -1.769      7.6098  0.6820   -1.611
+#     A_B/A_N   -0.996                       -0.953
+#     sign(A_B)  positive, as Delta q = +1    negative, as Delta q = -1  [OK]
+#
+# 5.2 Spectral windows, raw mode sums, ratio to the untruncated reference
+#
+#     window        C_B trunc   C_B tail    C_N trunc   C_N tail   reference
+      0-5 meV         17.647      7.314      1006.221    262.507     1.000
+      0-10 meV        13.616      6.763         3.515      2.171     1.000
+      10-20 meV        0.914      0.860         0.729      0.644     1.000
+      20-50 meV        0.995      1.059         0.975      1.084     1.000
+      50-100 meV       1.056      1.062         1.042      1.046     1.000
+      100-150 meV      1.005      1.008         1.002      1.012     1.000
+      150-220 meV      0.932      0.938         0.932      0.937     1.000
+#     (C_N 0-5 raw ratio is inflated: the reference value there is 1.9e-05,
+#      essentially zero. Use the absolute error, not the ratio, in that window.)
+#
+# 5.3 Error budget below 150 meV, absolute S units (rank on sum|error|)
+#
+#     window          C_B trunc  C_B tail   C_N trunc  C_N tail
+      0-5              +0.0721   +0.0274     +0.0192   +0.0050
+      5-10             +0.0200   +0.0147     +0.0089   +0.0081
+      10-20            -0.0069   -0.0112     -0.0204   -0.0267
+      20-50            -0.0009   +0.0101     -0.0034   +0.0115
+      50-100           +0.0162   +0.0179     +0.0143   +0.0159
+      100-150          +0.0016   +0.0025     +0.0005   +0.0024
+      sum|error|        0.1178    0.0838      0.0666    0.0696
+#     change from the tail:   C_B -29%          C_N +4%
+#
+#     optical 150-220  -0.1041   -0.0938     -0.1047   -0.0960
+#     S_tot error       -0.08%    -1.36%      -3.72%    -3.46%
+#     (S_tot is not a useful acceptance test: see 4.6)
+#
+# 5.4 Fill quality against the reference's true forces in the filled region
+#
+#     quantity                      C_B      C_N
+      fill error, all 660 atoms   0.6143   0.6157
+      fill error, treated region  0.4480   0.4532
+      truncation, by construction 1.0000   1.0000
+#
+#     median fill/true, per group    C_B      C_N
+      B|L-1                         0.80     0.86
+      B|L+1                         0.81     0.86
+      B|L+0                         0.98     0.91
+      N|L+0                         0.91     0.97
+      N|L-1                         0.97     0.81
+      N|L+1                         1.02     0.81
+#     Every ratio is at or below 1: the fill systematically undershoots.
+#     Section 6 explains why.
+#
+# 5.5 Fill-exponent modes, C_B, all else at the best configuration
+#
+#     mode                sum|error|<150   S_tot error
+      truncation              0.1177         -0.08%
+      fixed  (A/r^2)          0.0975         -1.30%
+      auto, R^2 >= 0.8        0.0886         -1.67%
+      auto, R^2 >= 0.7        0.0838         -1.36%
+      fitted (all groups)     0.1031         -1.03%
+#     The R^2 gate does not transfer: C_B splits cleanly at 0.57 | 0.73 | 0.85,
+#     while all four C_N off-layer groups sit at 0.67-0.68 with no gap.
+
+
+# -----------------------------------------------------------------------------
+# 6. THE FINDING THAT CLOSED THE QUESTION
+# -----------------------------------------------------------------------------
+# The 10x8 and 15x9 references were compared on the 960 atoms they BOTH supply
+# -- the one comparison every other table conflated with truncation.
+#
+#     shell (A)    n     C_B ratio   C_N ratio   difference
+      0-4          27      0.995       0.996       0.0010
+      4-8         168      0.965       0.966       0.0006
+      8-12       ~290      0.870       0.871       0.0010
+      12-16      ~275      0.785       0.787       0.0020
+      16+        ~200      0.643       0.637       0.0059
+      all         960      0.901       0.901         --
+#
+# The two references agree to 0.5% at the defect and diverge steadily outward,
+# with the crossover at the 10x8's own isotropic radius of 12.53 A. The profiles
+# are IDENTICAL for Delta q = +1 and Delta q = -1, to better than 0.006 in every
+# shell. Agreement in the 0-4 A shell rules out a settings or k-mesh difference.
+# This is periodic-image suppression of a charged defect's field in a finite
+# supercell, and it is a property of the CELL, not of the defect.
+#
+# Error budget of the truncated embedding:
+#
+#     quantity                              C_B          C_N
+      total reference field (eV/A)        186.77       185.61
+      supplied by truncation (eV/A)       147.30       146.27
+      supplied by truncation (%)            78.9         78.8
+      missing (eV/A)                       39.47        39.34
+      ... in the 660 zeroed atoms          23.24        23.23
+      ... in the zeroed atoms (% missing)   58.9         59.0
+      ... suppressed in the MATCHED region 16.22        16.11
+      ... suppressed (% of missing)         41.1         41.0
+#
+# Two fifths of the missing field sits on atoms the tail never touches. Worse,
+# the amplitude is fitted over 6-12 A where the 10x8's own field is already
+# 3-13% low, so the fill inherits the suppression. That is why every fill ratio
+# in 5.4 is below 1, and why no exponent, window or cap moved them much.
+#
+# The premise the correction was built on -- that the reference is correct
+# inside its own domain and only missing outside -- is false.
+
+
+# -----------------------------------------------------------------------------
+# 7. CONCLUSIONS
+# -----------------------------------------------------------------------------
+# 7.1 The tail is not a general correction. It reduces the absolute sub-optical
+#     error by 29% for C_B and increases it by 4% for C_N, with a threshold that
+#     has to be re-picked per system. Do not apply it to production numbers.
+#
+# 7.2 The tail cannot reach the dominant error. It addresses at most 59% of the
+#     missing field, using an amplitude measured on a field that is itself
+#     suppressed by ~10% overall and up to 36% at large r.
+#
+# 7.3 A radial monopole has an accuracy floor here. The reference's own field in
+#     the fill region has R^2 0.59-0.81 against any radial law, so roughly a
+#     third of it is angular structure no radial model can represent. The fill
+#     sits at 0.45 relative error, close to that floor.
+#
+# 7.4 Publishable result: a 10x8 reference reproduces 90.1% of the converged
+#     transition force field on the atoms it supplies, degrading from 99.5%
+#     within 4 A of the defect to ~64% beyond 16 A, with the crossover at its
+#     own isotropic radius. Measured identically on two defects of opposite
+#     charge. This is a convergence criterion for the embedding method.
+#
+# 7.5 The route to a converged far field is a larger reference, or an image
+#     correction applied to the reference forces themselves. Not a better tail.
+#
+# 7.6 Worth keeping regardless: defect alignment, the defect-correspondence
+#     check, the band.yaml/POSCAR consistency check, the fill-region audit and
+#     the matched-region agreement table. The last answers "is my reference big
+#     enough" directly and is defect independent.
+#
+# 7.7 Caveats. C3 (|F~(q)| at the smallest non-zero q) does not track the
+#     spectral error and should be reported as a diagnostic, not ranked on.
+#     The optical-window deficit (0.932 of the reference in truncation, both
+#     defects) is a reference limitation, is barely moved by the tail, and
+#     dominates S_tot for C_N.
